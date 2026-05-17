@@ -1,0 +1,5 @@
+1. Right click on white-space of folder
+2. Click on "open terminal"
+3. Run "npm run dev" without double quotes
+
+To stop the game, go to terminal and press Ctrl+C
