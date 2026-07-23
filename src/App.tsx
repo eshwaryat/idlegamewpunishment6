@@ -1,67 +1,202 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Pause, RotateCcw, Download, User, TrendingUp, Plus, Crown, Building2, Target, Sparkles } from 'lucide-react';
 
-// --- TYPES ---
-interface BusinessType {
-  id: string;
-  name: string;
-  baseCost: number;
-  baseRevenue: number;
-  baseTime: number;
-  icon: string;
-  description: string;
-  costMultiplier: number;
-  upgradeBonus: number;
-  managerCost: number;
-  upgradeCostMultiplier: number;
+// ── business definitions ──
+const BIZ_TYPES = [
+  { id:'lemonade',     name:'Lemonade Stand',   baseCost:4,             baseRev:1,           baseTime:2000,  icon:'🍋', costMul:1.15, upgBonus:1.35, mgrCost:1000,          upgCostMul:5   },
+  { id:'newspaper',    name:'Newspaper Route',  baseCost:80,            baseRev:10,          baseTime:4000,  icon:'📰', costMul:1.14, upgBonus:1.35, mgrCost:5000,          upgCostMul:4.5 },
+  { id:'carwash',      name:'Car Wash',         baseCost:1600,          baseRev:100,         baseTime:6000,  icon:'🚗', costMul:1.13, upgBonus:1.35, mgrCost:25000,         upgCostMul:4.0 },
+  { id:'pizza',        name:'Pizza Delivery',   baseCost:32000,         baseRev:1000,        baseTime:8000,  icon:'🍕', costMul:1.12, upgBonus:1.35, mgrCost:150000,        upgCostMul:3.5 },
+  { id:'arcade',       name:'Arcade',           baseCost:640000,        baseRev:10000,       baseTime:10000, icon:'🎮', costMul:1.11, upgBonus:1.35, mgrCost:1000000,       upgCostMul:3.0 },
+  { id:'cinema',       name:'Movie Theater',    baseCost:12800000,      baseRev:100000,      baseTime:12000, icon:'🎬', costMul:1.10, upgBonus:1.35, mgrCost:10000000,      upgCostMul:2.8 },
+  { id:'bank',         name:'Bank',             baseCost:128000000,     baseRev:1000000,     baseTime:14000, icon:'🏦', costMul:1.09, upgBonus:1.35, mgrCost:100000000,     upgCostMul:2.6 },
+  { id:'oilrig',       name:'Oil Company',      baseCost:128000000,     baseRev:10000000,    baseTime:16000, icon:'🛢️', costMul:1.08, upgBonus:1.35, mgrCost:1000000000,    upgCostMul:2.4 },
+  { id:'airline',      name:'Airline',          baseCost:12800000000,   baseRev:100000000,   baseTime:18000, icon:'✈️', costMul:1.07, upgBonus:1.35, mgrCost:15000000000,   upgCostMul:2.2 },
+  { id:'spacestation', name:'Space Station',    baseCost:128000000000,  baseRev:1000000000,  baseTime:20000, icon:'🚀', costMul:1.06, upgBonus:1.35, mgrCost:200000000000,  upgCostMul:2.0 },
+];
+
+// ── punishment / freeze config ──
+const P = {
+  WINDOW: 15000,            // ms window per optimal step
+  WARN_AT: 6000,            // ms left when warning bar turns orange/red
+  BASE: 0.05,               // 5% of balance per miss
+  SCALE: 1.5,               // exponential escalation factor
+  MAX_EXP: 7,               // exponent cap
+  FREEZE_AFTER: 3,          // consecutive deadlock-wipe rounds before freeze
+  DEADLOCK_WIPE_FRAC: 0.95, // punishment must wipe >= this fraction of balance to count
+  FREEZE_DURATION: 20000,   // how long a freeze lasts (ms)
+};
+
+// ════════════════════════════════════════════════════════════
+//  SHARED EFFECTIVE INCOME MODEL
+//  Single source of truth for a business's CURRENT income/sec,
+//  based on actual game state:
+//    - Managed business             -> full income
+//    - Unmanaged but running        -> 50% income
+//    - Unmanaged and not running    -> 0 income
+//  Used by calcOptimalStep() (for TimeToAfford / current income),
+//  calcIPS(), isInDeadlock(), and the freeze system, so they all
+//  agree on the player's actual current income.
+// ════════════════════════════════════════════════════════════
+function effectiveIncomePerSec(b, ascBonus) {
+  if (b.owned === 0) return 0;
+
+  let r = b.baseRev * Math.pow(b.upgBonus, b.upgradeLevel);
+  let m = 1;
+  if (b.owned >= 10)  m *= 2;
+  if (b.owned >= 25)  m *= 2;
+  if (b.owned >= 50)  m *= 3;
+  if (b.owned >= 75)  m *= 3;
+  if (b.owned >= 100) m *= 4;
+  if (b.owned >= 200) m *= 5;
+
+  const cycSec = (b.baseTime / (1 + b.upgradeLevel * 0.05)) / 1000;
+  const raw = (r * m * ascBonus * b.owned) / cycSec;
+
+  if (b.hasManager) return raw;       // fully automated
+  if (b.isRunning)  return raw * 0.5; // manual, mid-cycle: counted at 50%
+  return 0;                           // not running: no income at all
 }
 
-interface Business extends BusinessType {
-  owned: number;
-  totalRevenue: number;
-  progress: number;
-  isRunning: boolean;
-  upgradeLevel: number;
-  totalProduced: number;
-  hasManager: boolean;
+// ════════════════════════════════════════════════════════════
+//  DYNAMIC OPTIMAL STEP ENGINE
+//  Returns { type, biz, cost, score, affordable } — the single best
+//  action given current game state, scored uniformly as:
+//
+//      Score = TimeToAfford + (Cost / GainPerSecond)
+//
+//  where TimeToAfford = max(0, (Cost - CurrentMoney) / CurrentIncomePerSecond)
+//
+//  Purchases, Upgrades, and Manager hires are all scored with this
+//  same formula. Lower score = better. Unaffordable actions are NOT
+//  penalized — they're scored normally, since a high-value action
+//  that's currently unaffordable can still be "optimal" if the time
+//  needed to save up for it is small relative to its payoff.
+// ════════════════════════════════════════════════════════════
+function calcOptimalStep(bizList, currentMoney, ascBonus) {
+
+  // ── helper: PROJECTED revenue/s for a business in a hypothetical state ──
+  // Used only to compute the Gain (delta income/sec) of a simulated future
+  // action (purchase/upgrade/manager). Assumes a managed business runs at
+  // full output and an unmanaged one runs at its 50% manual-play average,
+  // regardless of its current isRunning flag — this is a projection of
+  // production under the new state, not the player's current income.
+  // (Current income uses effectiveIncomePerSec() instead — see above.)
+  const revPerSec = (b, overrideOwned, overrideLevel) => {
+    const owned = overrideOwned ?? b.owned;
+    const level = overrideLevel ?? b.upgradeLevel;
+    if (owned === 0) return 0;
+    let r = b.baseRev * Math.pow(b.upgBonus, level);
+    let m = 1;
+    if (owned >= 10)  m *= 2;
+    if (owned >= 25)  m *= 2;
+    if (owned >= 50)  m *= 3;
+    if (owned >= 75)  m *= 3;
+    if (owned >= 100) m *= 4;
+    if (owned >= 200) m *= 5;
+    const cycSec = (b.baseTime / (1 + level * 0.05)) / 1000;
+    const raw = (r * m * ascBonus * owned) / cycSec;
+    // If no manager, player must click — credit only 50% of theoretical max
+    return b.hasManager ? raw : raw * 0.5;
+  };
+
+  const cost = b => Math.floor(b.baseCost * Math.pow(b.costMul, b.owned));
+
+  // Total current income/sec across the whole empire — used for TimeToAfford.
+  // Uses the SHARED effective income model (actual isRunning/hasManager state),
+  // so this agrees with calcIPS()/deadlock/freeze on the player's real income.
+  const currentIncomePerSecond = bizList.reduce((s, b) => s + effectiveIncomePerSec(b, ascBonus), 0);
+
+  // Unified scoring function used by every action type
+  const score = (actionCost, gain) => {
+    if (gain <= 0) return Infinity; // an action with no payoff is never worth doing
+    const timeToAfford = currentIncomePerSecond > 0
+      ? Math.max(0, (actionCost - currentMoney) / currentIncomePerSecond)
+      : (actionCost > currentMoney ? Infinity : 0);
+    return timeToAfford + (actionCost / gain);
+  };
+
+  const candidates = [];
+
+  for (const b of bizList) {
+    // ── PURCHASE ──
+    const pc = cost(b);
+    const currentRPS = revPerSec(b);
+    const afterRPS   = revPerSec(b, b.owned + 1);
+    const deltaRPS   = afterRPS - currentRPS;
+    candidates.push({
+      type: 'PURCHASE', biz: b.id,
+      cost: pc,
+      score: score(pc, deltaRPS),
+      affordable: currentMoney >= pc,
+    });
+
+    if (b.owned > 0) {
+      // ── UPGRADE ── (same formula as purchase, no efficiency discount)
+      const uc = b.baseCost * 50 * Math.pow(b.upgCostMul, b.upgradeLevel);
+      const currentRPS_u = revPerSec(b);
+      const afterRPS_u   = revPerSec(b, b.owned, b.upgradeLevel + 1);
+      const deltaRPS_u   = afterRPS_u - currentRPS_u;
+      candidates.push({
+        type: 'UPGRADE', biz: b.id,
+        cost: uc,
+        score: score(uc, deltaRPS_u),
+        affordable: currentMoney >= uc,
+      });
+
+      // ── HIRE_MANAGER ── (same formula, no manager multiplier)
+      if (!b.hasManager) {
+        const mc = b.mgrCost;
+        // Gain = extra revenue/s unlocked by full automation vs the 50% manual credit
+        const deltaRPS_m = revPerSec(b) * (1 / 0.5 - 1); // doubles effective RPS
+        candidates.push({
+          type: 'HIRE_MANAGER', biz: b.id,
+          cost: mc,
+          score: score(mc, deltaRPS_m),
+          affordable: currentMoney >= mc,
+        });
+      }
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  // Sort purely by score — lowest (best) first.
+  candidates.sort((a, b) => a.score - b.score);
+  return candidates[0];
 }
 
-interface Dialogue { id: number; message: string; }
-interface Achievement { id: string; name: string; description: string; icon: string; }
-interface DisplayedAchievement extends Achievement { timestamp: number; }
-interface EventLogEntry { timestamp: number; sessionTime: number; eventType: string; [key: string]: any; }
+// ════════════════════════════════════════
+const freshBiz = () => BIZ_TYPES.map(b => ({
+  ...b,
+  owned: 0,
+  progress: 0,
+  isRunning: false,
+  upgradeLevel: 0,
+  hasManager: false,
+}));
 
-const IdleEmpireGame = () => {
-  // --- STATE (Visuals) ---
-  const [userName, setUserName] = useState('');
-  const [gameStarted, setGameStarted] = useState(false);
-  const [money, setMoney] = useState(4);
-  const [totalEarned, setTotalEarned] = useState(0);
-  const [lifetimeEarned, setLifetimeEarned] = useState(0);
-  const [isPaused, setIsPaused] = useState(false);
-  const [showTutorial, setShowTutorial] = useState(true);
-  
-  // --- REFS (Logic & Logging) ---
-  // Fix 1: Event Log is a Ref (No re-renders, no memory leak)
-  const eventLogRef = useRef<EventLogEntry[]>([]);
-  const [sessionStart, setSessionStart] = useState(Date.now());
-  
-  // Fix 2: Game State Refs (For the Game Loop to read without dependency slippage)
-  const businessesRef = useRef<Business[]>([]);
-  const moneyRef = useRef(money);
-  const totalEarnedRef = useRef(totalEarned);
-  const lifetimeEarnedRef = useRef(lifetimeEarned);
+const fmt = n => {
+  if (n >= 1e12) return '$' + (n / 1e12).toFixed(2) + 'T';
+  if (n >= 1e9)  return '$' + (n / 1e9 ).toFixed(2) + 'B';
+  if (n >= 1e6)  return '$' + (n / 1e6 ).toFixed(2) + 'M';
+  if (n >= 1e3)  return '$' + (n / 1e3 ).toFixed(2) + 'K';
+  return '$' + n.toFixed(2);
+};
 
-  const [dialogues, setDialogues] = useState<Dialogue[]>([]);
-  const [achievements, setAchievements] = useState<DisplayedAchievement[]>([]);
-  const [unlockedAchievements, setUnlockedAchievements] = useState(new Set<string>());
-  const [ascensionCount, setAscensionCount] = useState(0);
-  const [ascensionBonus, setAscensionBonus] = useState(1);
-  const [showAscensionModal, setShowAscensionModal] = useState(false);
-   
-  // Background music
-  const [backgroundMusic, setBackgroundMusic] = useState<HTMLAudioElement | null>(null);
-   
+// ════════════════════════════════════════
+export default function IdleEmpire() {
+  const [name,     setName]     = useState('');
+  const [started,  setStarted]  = useState(false);
+  const [money,    setMoney]    = useState(4);
+  const [earned,   setEarned]   = useState(0);
+  const [paused,   setPaused]   = useState(false);
+  const [biz,      setBiz]      = useState(freshBiz());
+  const [tutorial, setTutorial] = useState(true);
+  const [ascBonus, setAscBonus] = useState(1);
+
+  // ── audio ──
+  const [backgroundMusic, setBackgroundMusic] = useState(null);
+
   useEffect(() => {
     const music = new Audio('/sounds/background.mp3');
     music.loop = true;
@@ -69,770 +204,748 @@ const IdleEmpireGame = () => {
     setBackgroundMusic(music);
     return () => { music.pause(); music.src = ''; };
   }, []);
-   
+
   useEffect(() => {
     if (!backgroundMusic) return;
-    if (gameStarted && !isPaused) {
-      backgroundMusic.play().catch(err => console.log('Music autoplay blocked:', err));
+    if (started && !paused) {
+      backgroundMusic.play().catch(() => {});
     } else {
       backgroundMusic.pause();
     }
-  }, [gameStarted, isPaused, backgroundMusic]);
-   
-  const playKachingSound = () => {
+  }, [started, paused, backgroundMusic]);
+
+  const playKaching = () => {
     try {
       const audio = new Audio('/sounds/kaching.mp3');
       audio.volume = 0.5;
-      audio.play().catch(() => { /* ignore blocked audio */ });
-    } catch (error) { console.log('Audio error:', error); }
+      audio.play().catch(() => {});
+    } catch (e) {      
+      console.log(e);
+}
   };
 
-  // const businessTypes: BusinessType[] = [
-  //   { id: 'lemonade', name: 'Lemonade Stand', baseCost: 4, baseRevenue: 0.75, baseTime: 2000, icon: '🍋', description: 'Your first venture!', costMultiplier: 1.15, upgradeBonus: 1.5, managerCost: 1000, upgradeCostMultiplier: 5 },
-  //   { id: 'newspaper', name: 'Newspaper Route', baseCost: 80, baseRevenue:7.5, baseTime: 4000, icon: '📰', description: 'Deliver news!', costMultiplier: 1.14, upgradeBonus: 1.5, managerCost: 5000, upgradeCostMultiplier: 4.5},
-  //   { id: 'carwash', name: 'Car Wash', baseCost: 1600, baseRevenue: 75, baseTime: 6000, icon: '🚗', description: 'Shine wheels!', costMultiplier: 1.13, upgradeBonus: 1.5, managerCost: 25000, upgradeCostMultiplier: 4.0 },
-  //   { id: 'pizza', name: 'Pizza Delivery', baseCost: 32000, baseRevenue: 750, baseTime: 8000, icon: '🍕', description: 'Hot profits!', costMultiplier: 1.12, upgradeBonus: 1.5, managerCost: 150000, upgradeCostMultiplier: 3.5 },
-  //   { id: 'arcade', name: 'Arcade', baseCost: 640000, baseRevenue: 7500, baseTime: 10000, icon: '🎮', description: 'High scores!', costMultiplier: 1.11, upgradeBonus: 1.5, managerCost: 1000000, upgradeCostMultiplier: 3.0 },
-  //   { id: 'cinema', name: 'Movie Theater', baseCost: 12800000, baseRevenue: 75000, baseTime: 12000, icon: '🎬', description: 'Blockbusters!', costMultiplier: 1.10, upgradeBonus: 1.5, managerCost: 10000000, upgradeCostMultiplier: 2.8 },
-  //   { id: 'bank', name: 'Bank', baseCost: 128000000, baseRevenue: 750000, baseTime: 14000, icon: '🏦', description: 'Money begets money!', costMultiplier: 1.09, upgradeBonus: 1.5, managerCost: 100000000, upgradeCostMultiplier: 2.6 },
-  //   { id: 'oilrig', name: 'Oil Company', baseCost: 128000000, baseRevenue: 7500000, baseTime: 16000, icon: '🛢️', description: 'Black gold!', costMultiplier: 1.08, upgradeBonus: 1.5, managerCost: 1000000000, upgradeCostMultiplier: 2.4 },
-  //   { id: 'airline', name: 'Airline', baseCost: 12800000000, baseRevenue: 75000000, baseTime: 18000, icon: '✈️', description: 'Sky high!', costMultiplier: 1.07, upgradeBonus: 1.5, managerCost: 15000000000, upgradeCostMultiplier: 2.2 },
-  //   { id: 'spacestation', name: 'Space Station', baseCost: 128000000000, baseRevenue: 750000000, baseTime: 20000, icon: '🚀', description: 'To infinity!', costMultiplier: 1.06, upgradeBonus: 1.5, managerCost: 200000000000, upgradeCostMultiplier: 2.0 }
-  // ];
-
-  
-  const businessTypes: BusinessType[] = [ // experimental increment in baseRevenue from 0.75 to 1.00
-    { id: 'lemonade', name: 'Lemonade Stand', baseCost: 4, baseRevenue: 1.00, baseTime: 2000, icon: '🍋', description: 'Your first venture!', costMultiplier: 1.15, upgradeBonus: 1.5, managerCost: 1000, upgradeCostMultiplier: 5 },
-    { id: 'newspaper', name: 'Newspaper Route', baseCost: 80, baseRevenue:10.0, baseTime: 4000, icon: '📰', description: 'Deliver news!', costMultiplier: 1.14, upgradeBonus: 1.5, managerCost: 5000, upgradeCostMultiplier: 4.5},
-    { id: 'carwash', name: 'Car Wash', baseCost: 1600, baseRevenue: 100, baseTime: 6000, icon: '🚗', description: 'Shine wheels!', costMultiplier: 1.13, upgradeBonus: 1.5, managerCost: 25000, upgradeCostMultiplier: 4.0 },
-    { id: 'pizza', name: 'Pizza Delivery', baseCost: 32000, baseRevenue: 1000, baseTime: 8000, icon: '🍕', description: 'Hot profits!', costMultiplier: 1.12, upgradeBonus: 1.5, managerCost: 150000, upgradeCostMultiplier: 3.5 },
-    { id: 'arcade', name: 'Arcade', baseCost: 640000, baseRevenue: 10000, baseTime: 10000, icon: '🎮', description: 'High scores!', costMultiplier: 1.11, upgradeBonus: 1.5, managerCost: 1000000, upgradeCostMultiplier: 3.0 },
-    { id: 'cinema', name: 'Movie Theater', baseCost: 12800000, baseRevenue: 100000, baseTime: 12000, icon: '🎬', description: 'Blockbusters!', costMultiplier: 1.10, upgradeBonus: 1.5, managerCost: 10000000, upgradeCostMultiplier: 2.8 },
-    { id: 'bank', name: 'Bank', baseCost: 128000000, baseRevenue: 1000000, baseTime: 14000, icon: '🏦', description: 'Money begets money!', costMultiplier: 1.09, upgradeBonus: 1.5, managerCost: 100000000, upgradeCostMultiplier: 2.6 },
-    { id: 'oilrig', name: 'Oil Company', baseCost: 128000000, baseRevenue: 10000000, baseTime: 16000, icon: '🛢️', description: 'Black gold!', costMultiplier: 1.08, upgradeBonus: 1.5, managerCost: 1000000000, upgradeCostMultiplier: 2.4 },
-    { id: 'airline', name: 'Airline', baseCost: 12800000000, baseRevenue: 100000000, baseTime: 18000, icon: '✈️', description: 'Sky high!', costMultiplier: 1.07, upgradeBonus: 1.5, managerCost: 15000000000, upgradeCostMultiplier: 2.2 },
-    { id: 'spacestation', name: 'Space Station', baseCost: 128000000000, baseRevenue: 1000000000, baseTime: 20000, icon: '🚀', description: 'To infinity!', costMultiplier: 1.06, upgradeBonus: 1.5, managerCost: 200000000000, upgradeCostMultiplier: 2.0 }
-  ];
-
-  const initialBusinesses = businessTypes.map(b => ({ ...b, owned: 0, totalRevenue: 0, progress: 0, isRunning: false, upgradeLevel: 0, totalProduced: 0, hasManager: false }));
-  const [businesses, setBusinesses] = useState<Business[]>(initialBusinesses);
-
-  // --- SYNC REFS (Critical for Game Loop) ---
-  useEffect(() => { businessesRef.current = businesses; }, [businesses]);
-  useEffect(() => { moneyRef.current = money; }, [money]);
-  useEffect(() => { totalEarnedRef.current = totalEarned; }, [totalEarned]);
-  useEffect(() => { lifetimeEarnedRef.current = lifetimeEarned; }, [lifetimeEarned]);
-
-  const characterDialogues = {
-    firstPurchase: [ "🎉 Your first business! The journey begins!", "💪 That's the spirit! Let's build something great!", "🌟 Every empire starts with a single step!" ],
-    unlockBusiness: { newspaper: "📰 Moving up in the world!", carwash: "🚗 Shiny profits ahead!", pizza: "🍕 Mama mia! Spicy move!", arcade: "🎮 Game on! High scores = high profits!", cinema: "🎬 Lights, camera, MONEY!", bank: "🏦 Playing with big money now!", oilrig: "🛢️ Strike oil, strike gold!", airline: "✈️ Sky's the limit!", spacestation: "🚀 TO THE MOON! You legend!" } as Record<string, string>,
-    milestones: [ "💰 Cha-ching!", "⚡ Keep hustling!", "🔥 You're on fire!", "😎 Empire's growing!", "🎯 Smart moves!", "⭐ Crushing it!" ],
-    firstManager: [ "👔 First manager! Automation time!", "🎩 Hired help!", "💼 That's how pros do it!" ],
-    upgrades: [ "📈 Upgraded! Efficiency up!", "⚙️ Turbocharged!", "🚀 Level up!" ],
-    ascension: [ "🌟 ASCENSION! You've transcended!", "✨ The universe resets, wisdom remains!", "🎆 Sacrifice brings greater power!" ]
+  const playBuzzer = () => {
+    try {
+      const audio = new Audio('/sounds/buzzer.mp3');
+      audio.volume = 0.6;
+      audio.play().catch(() => {});
+    } catch (e) {
+      console.log(e);
+    }
   };
-   
-  const achievementsList: Achievement[] = [ 
-    { id: 'first_purchase', name: 'Entrepreneur', description: 'Buy your first business', icon: '🎯' }, 
-    { id: 'five_businesses', name: 'Business Owner', description: 'Own 5 of any business', icon: '🏢' }, 
-    { id: 'first_manager', name: 'Delegator', description: 'Hire your first manager', icon: '👔' }, 
-    { id: 'millionaire', name: 'Millionaire', description: 'Earn $1,000,000', icon: '💰' }, 
-    { id: 'unlock_pizza', name: 'Pizza Tycoon', description: 'Unlock Pizza Delivery', icon: '🍕' }, 
-    { id: 'unlock_cinema', name: 'Movie Mogul', description: 'Unlock Movie Theater', icon: '🎬' }, 
-    { id: 'unlock_bank', name: 'Banking Boss', description: 'Unlock Bank', icon: '🏦' }, 
-    { id: 'unlock_space', name: 'Space Pioneer', description: 'Unlock Space Station', icon: '🚀' }, 
-    { id: 'ten_upgrades', name: 'Optimizer', description: 'Purchase 10 upgrades total', icon: '⚙️' }, 
-    { id: 'speed_demon', name: 'Speed Demon', description: 'Start 50 productions', icon: '⚡' },
-    { id: 'first_ascension', name: 'Transcendent', description: 'Complete your first ascension', icon: '🌟' },
-    { id: 'multi_ascension', name: 'Cosmic Entity', description: 'Ascend 5 times', icon: '✨' }
-  ];
-   
-  // Fix 3: Log Event writes to Ref (Instant, no re-render)
-  const logEvent = (eventType: string, data: Record<string, any> = {}) => { 
-  const now = Date.now();
-  const event: EventLogEntry = { 
-    timestamp: now, 
-    sessionTime: now - sessionStart,
-    eventType,
-    userName,
-    // Fix: Prioritize 'new' values passed from the function call to prevent 1-tick slippage
-    currentMoney: data.newBalance !== undefined ? data.newBalance : moneyRef.current,
-    totalEarned: data.newTotalEarned !== undefined ? data.newTotalEarned : totalEarnedRef.current,
-    lifetimeEarned: data.newLifetimeEarned !== undefined ? data.newLifetimeEarned : lifetimeEarnedRef.current,
-    ascensionCount,
-    ascensionBonus,
-    ...data 
-  }; 
-  // Fix: Shallow copy prevents future state changes from leaking into old logs
-  eventLogRef.current.push({ ...event }); 
-};
 
+  // punishment state
+  const [misses,     setMisses]     = useState(0);
+  const [deadline,   setDeadline]   = useState(null);
+  const [timeLeft,   setTimeLeft]   = useState(null);
+  const [fineLog,    setFineLog]    = useState([]);
+  const [totalFines, setTotalFines] = useState(0);
+  const [shake,      setShake]      = useState(false);
+  const [flashMsg,   setFlashMsg]   = useState(null);
+  const [botActive,  setBotActive]  = useState(false);
 
-  const showDialogue = (message: string) => { const id = Date.now(); setDialogues(prev => [...prev, { id, message }]); setTimeout(() => { setDialogues(prev => prev.filter(d => d.id !== id)); }, 4000); };
-  
-  const unlockAchievement = (achievementId: string) => { 
-    if (!unlockedAchievements.has(achievementId)) { 
-        const achievement = achievementsList.find(a => a.id === achievementId); 
-        if (achievement) { 
-            setUnlockedAchievements(prev => new Set(prev).add(achievementId)); 
-            setAchievements(prev => [...prev, { ...achievement, timestamp: Date.now() }]); 
-            setTimeout(() => { setAchievements(prev => prev.filter(a => a.id !== achievementId)); }, 5000); 
-            logEvent('ACHIEVEMENT', { achievementId, achievementName: achievement.name }); 
-        } 
-    } 
+  // current optimal step (recomputed after every action)
+  const [optimalStep,    setOptimalStep]    = useState(null);
+  const [stepsChecked,   setStepsChecked]   = useState(0);  // total steps evaluated (for log)
+  const [correctActions, setCorrectActions] = useState(0);  // player matched optimal
+
+  // deadlock / freeze
+  const [freezeUntil,    setFreezeUntil]    = useState(null);
+  const [isFrozen,       setIsFrozen]       = useState(false);
+  const [deadlockStreak, setDeadlockStreak] = useState(0);
+  const [roiPerSec,      setRoiPerSec]      = useState(0);
+
+  // refs (game loop reads these without stale closures)
+  const rBiz            = useRef(freshBiz());
+  const rMoney          = useRef(4);
+  const rEarned         = useRef(0);
+  const rMisses         = useRef(0);
+  const rDeadline       = useRef(null);
+  const rBotActive      = useRef(false);
+  const rSession        = useRef(Date.now());
+  const rLog            = useRef([]);
+  const rFreezeUntil    = useRef(null);
+  const rDeadlockStreak = useRef(0);
+  const rOptimalStep    = useRef(null);   // what the engine currently expects
+  const rAscBonus       = useRef(1);
+
+  useEffect(()=>{ rBiz.current            = biz;            },[biz]);
+  useEffect(()=>{ rMoney.current          = money;          },[money]);
+  useEffect(()=>{ rEarned.current         = earned;         },[earned]);
+  useEffect(()=>{ rMisses.current         = misses;         },[misses]);
+  useEffect(()=>{ rDeadline.current       = deadline;       },[deadline]);
+  useEffect(()=>{ rBotActive.current      = botActive;      },[botActive]);
+  useEffect(()=>{ rFreezeUntil.current    = freezeUntil;    },[freezeUntil]);
+  useEffect(()=>{ rDeadlockStreak.current = deadlockStreak; },[deadlockStreak]);
+  useEffect(()=>{ rOptimalStep.current    = optimalStep;    },[optimalStep]);
+  useEffect(()=>{ rAscBonus.current       = ascBonus;       },[ascBonus]);
+
+  // ── calc helpers (used in game loop, must be stable) ──
+  const cost = b => Math.floor(b.baseCost * Math.pow(b.costMul, b.owned));
+  const rev  = (b, overrideOwned, overrideLevel) => {
+    const owned = overrideOwned ?? b.owned;
+    const level = overrideLevel ?? b.upgradeLevel;
+    if (owned === 0) return 0;
+    let r = b.baseRev * Math.pow(b.upgBonus, level);
+    let m = 1;
+    if (owned >= 10)  m *= 2;
+    if (owned >= 25)  m *= 2;
+    if (owned >= 50)  m *= 3;
+    if (owned >= 75)  m *= 3;
+    if (owned >= 100) m *= 4;
+    if (owned >= 200) m *= 5;
+    return r * m * rAscBonus.current;
   };
-   
-  const calculateCost = (business: Business) => Math.floor(business.baseCost * Math.pow(business.costMultiplier, business.owned));
-   
-  const calculateRevenue = (business: Business) => {
-    let baseRevenue = business.baseRevenue * Math.pow(business.upgradeBonus, business.upgradeLevel);
-    let multiplier = 1;
-    if (business.owned >= 10) multiplier *= 2;
-    if (business.owned >= 25) multiplier *= 2;
-    if (business.owned >= 50) multiplier *= 3;
-    if (business.owned >= 75) multiplier *= 3;
-    if (business.owned >= 100) multiplier *= 4;
-    if (business.owned >= 150) multiplier *= 4;
-    if (business.owned >= 200) multiplier *= 5;
-    return baseRevenue * multiplier * ascensionBonus;
+  const ctime = b => b.baseTime / (1 + b.upgradeLevel * 0.05);
+
+  // Current total income/sec — single source of truth, shared with calcOptimalStep.
+  const calcIPS = (bizList) => bizList.reduce(
+    (s, b) => s + effectiveIncomePerSec(b, rAscBonus.current), 0
+  );
+
+  // ── recompute optimal step and arm timer ──
+  const recomputeOptimal = (bizList, currentMoney, isFirstAction = false) => {
+    const step = calcOptimalStep(bizList, currentMoney, rAscBonus.current);
+    setOptimalStep(step);
+    rOptimalStep.current = step;
+
+    if (step) {
+      const d = Date.now() + P.WINDOW;
+      setDeadline(d); rDeadline.current = d;
+      if (isFirstAction) {
+        setBotActive(true); rBotActive.current = true;
+      }
+    }
+    return step;
   };
-   
-  const calculateTime = (business: Business) => business.baseTime / (1 + business.upgradeLevel * 0.05);
-  const calculateAscensionCost = () => Math.pow(10, 10 + ascensionCount);
-  const calculateAscensionBonus = () => 150 * Math.sqrt(lifetimeEarned / Math.pow(10, 15));
-  const canAscend = () => lifetimeEarned >= calculateAscensionCost();
-   
-   
-  const buyBusiness = (businessId: string) => { 
-  const business = businesses.find(b => b.id === businessId); 
-  if (!business) return; 
-  const cost = calculateCost(business); 
-  
-  if (money >= cost) { 
-    playKachingSound();
-    const newBal = money - cost; // Calculate exactly what the balance will be
-    const newOwnedCount = business.owned + 1; // Track what the new amount will be
 
-    setMoney(newBal); 
-    setBusinesses(prev => prev.map(b => b.id === businessId ? { ...b, owned: b.owned + 1 } : b)); 
+  // ── logging ──
+  // Every event automatically captures ips and currentMisses so analysts
+  // can reconstruct income trajectory and punishment exposure for any moment
+  // in the session without needing to join against other events.
+  const log = (type, data = {}) => rLog.current.push({
+    ts: Date.now(), sMs: Date.now() - rSession.current,
+    type, name, money: rMoney.current, earned: rEarned.current,
+    ips: calcIPS(rBiz.current),
+    currentMisses: rMisses.current,
+    ...data,
+  });
 
-    // --- CALCULATE MILESTONES ---
-      const milestones = [10, 25, 50, 75, 100, 150, 200];
-      const nextMilestone = milestones.find(m => m >= newOwnedCount);
-      const awayFromMilestone = nextMilestone ? nextMilestone - newOwnedCount : null;
-      // ----------------------------
-    
-    // 1. CAPTURE STATE BEFORE UPDATE
-      const isFirstPurchase = businesses.every(b => b.owned === 0); 
-      const isFirstOfType = business.owned === 0; 
-      
-      // 2. DIALOGUE & ACHIEVEMENT LOGIC (INSERT THIS BLOCK)
-      if (isFirstPurchase) { 
-        showDialogue(characterDialogues.firstPurchase[Math.floor(Math.random() * characterDialogues.firstPurchase.length)]); 
-        unlockAchievement('first_purchase'); 
-      } else if (isFirstOfType) { 
-        // Trigger specific dialogue for unlocking a new business type
-        if (characterDialogues.unlockBusiness[businessId]) {
-            showDialogue(characterDialogues.unlockBusiness[businessId]);
+  const flash = (msg, color = '#ef4444') => {
+    setFlashMsg({ msg, color });
+    setTimeout(() => setFlashMsg(null), 3200);
+  };
+
+  // ── deadlock check (payback principle) ──
+  const isInDeadlock = (bizList, currentMoney, timeLeftMs) => {
+    const step = rOptimalStep.current;
+    if (!step) return false;
+
+    const targetBiz = bizList.find(b => b.id === step.biz);
+    if (!targetBiz) return false;
+
+    let requiredCost = 0;
+    if (step.type === 'PURCHASE')          requiredCost = cost(targetBiz);
+    else if (step.type === 'UPGRADE')      requiredCost = targetBiz.baseCost * 50 * Math.pow(targetBiz.upgCostMul, targetBiz.upgradeLevel);
+    else if (step.type === 'HIRE_MANAGER') requiredCost = targetBiz.mgrCost;
+
+    if (requiredCost <= 0 || currentMoney >= requiredCost) return false;
+
+    const ips = calcIPS(bizList);
+    if (ips <= 0) return true;
+
+    const deficit   = requiredCost - currentMoney;
+    const secNeeded = deficit / ips;
+    const secLeft   = (timeLeftMs ?? P.WINDOW) / 1000;
+    return secNeeded > secLeft;
+  };
+
+  // ── freeze helper ──
+  const applyFreeze = () => {
+    const until = Date.now() + P.FREEZE_DURATION;
+    setFreezeUntil(until); rFreezeUntil.current = until;
+    setIsFrozen(true);
+    // Extend deadline by freeze duration
+    const dl = rDeadline.current;
+    if (dl) {
+      const newDl = dl + P.FREEZE_DURATION;
+      setDeadline(newDl); rDeadline.current = newDl;
+    }
+    // Capture streak BEFORE resetting so the value that triggered the freeze is preserved in the log
+    const triggerStreak = rDeadlockStreak.current;
+    setDeadlockStreak(0); rDeadlockStreak.current = 0;
+    log('DEADLOCK_FREEZE', { freezeUntil: until, freezeDuration: P.FREEZE_DURATION, triggerStreak, optimalStep: rOptimalStep.current });
+  };
+
+  // ── punish ──
+  const punish = () => {
+    const m = rMisses.current + 1;
+    setMisses(m); rMisses.current = m;
+
+    const exp  = Math.min(m - 1, P.MAX_EXP);
+    const frac = P.BASE * Math.pow(P.SCALE, exp);
+    const fine = rMoney.current * frac;
+    const nb   = Math.max(0, rMoney.current - fine);
+
+    const wipeRatio     = rMoney.current > 0 ? fine / rMoney.current : 0;
+    const wasDeadlocked = isInDeadlock(rBiz.current, nb, 0);
+    const isWipeRound   = wipeRatio >= P.DEADLOCK_WIPE_FRAC || nb < 0.01;
+
+    let newStreak = rDeadlockStreak.current;
+    if (isWipeRound && wasDeadlocked) {
+      newStreak++;
+      setDeadlockStreak(newStreak); rDeadlockStreak.current = newStreak;
+    } else {
+      newStreak = 0;
+      setDeadlockStreak(0); rDeadlockStreak.current = 0;
+    }
+
+    setMoney(nb); rMoney.current = nb;
+    setTotalFines(f => f + fine);
+    setFineLog(fl => [...fl.slice(-29), { fine, m, ts: Date.now(), step: rOptimalStep.current }]);
+
+    setShake(true);
+    setTimeout(() => setShake(false), 500);
+    playBuzzer();
+
+    const severity = m === 1 ? `⚡ Fine: ${fmt(fine)} deducted`
+                   : m <= 3  ? `💸 Penalty: ${fmt(fine)} (miss #${m})`
+                             : `💀 Escalating fine: ${fmt(fine)} (${m} misses!)`;
+    flash(severity);
+    log('PUNISHMENT', {
+      fine,
+      balanceAfter: nb,
+      missCount: m,          // post-increment miss count for this timeout
+      wipeRatio,
+      wasDeadlocked,
+      deadlockStreak: newStreak,
+      optimalStep: rOptimalStep.current,
+    });
+
+    // After punishment, recompute optimal from new state (money may have changed)
+    recomputeOptimal(rBiz.current, nb);
+    setStepsChecked(c => c + 1);
+
+    if (newStreak >= P.FREEZE_AFTER) {
+      setTimeout(() => applyFreeze(), 200);
+    }
+  };
+
+  // ── check if a player action matches the current optimal step ──
+  const checkAction = (type, bizId, isFirstEver, bizListAfter, moneyAfter) => {
+    if (isFirstEver) {
+      // Only initialize the optimal-step system and start the timer.
+      // No optimal step existed before this action, so it must not count
+      // toward accuracy stats (neither stepsChecked nor correctActions).
+      recomputeOptimal(bizListAfter, moneyAfter, true);
+      return;
+    }
+
+    const step = rOptimalStep.current;
+    if (!step) return;
+
+    if (step.type === type && step.biz === bizId) {
+      // Correct — reset misses, recompute next optimal
+      setMisses(0); rMisses.current = 0;
+      setDeadlockStreak(0); rDeadlockStreak.current = 0;
+      setCorrectActions(c => c + 1);
+      log('OPTIMAL_MATCH', { actualType: type, actualBiz: bizId, optimalStep: step });
+      recomputeOptimal(bizListAfter, moneyAfter);
+      setStepsChecked(c => c + 1);
+    } else {
+      // Wrong action — log both what the player did and what was expected
+      log('OPTIMAL_MISS', { actualType: type, actualBiz: bizId, optimalStep: step });
+    }
+  };
+
+  // ── countdown ticker ──
+  useEffect(() => {
+    if (!started || paused) return;
+    const id = setInterval(() => {
+      if (!rBotActive.current) return;
+
+      // Unfreeze check
+      const fu = rFreezeUntil.current;
+      if (fu) {
+        if (Date.now() >= fu) {
+          setFreezeUntil(null); rFreezeUntil.current = null;
+          setIsFrozen(false);
+        } else {
+          const d = rDeadline.current;
+          if (d) setTimeLeft(d - Date.now());
+          return;
         }
-        
-        // Unlock specific achievements
-        if (businessId === 'pizza') unlockAchievement('unlock_pizza'); 
-        if (businessId === 'cinema') unlockAchievement('unlock_cinema'); 
-        if (businessId === 'bank') unlockAchievement('unlock_bank'); 
-        if (businessId === 'spacestation') unlockAchievement('unlock_space'); 
-      } 
-      else if (awayFromMilestone === 0) {
-        // Exactly hit the milestone!
-        showDialogue(`🎉 BOOM! ${business.name} just got a multiplier bonus! 🚀`);
-      } 
-      // else if (awayFromMilestone !== null && (awayFromMilestone == 5)) { //||  awayFromMilestone == 3 || awayFromMilestone == 1)) {
-      //   // 5, 4, 3, 2, or 1 away from the next milestone
-      //   showDialogue(`Almost there! Just ${awayFromMilestone} more ${business.name}(s) for a multiplier boost!`);
-      // // =============================
-      // }
-      else if (Math.random() < 0.2) { 
-        // 20% chance to show a random "Keep hustling" message on standard purchases
-        showDialogue(characterDialogues.milestones[Math.floor(Math.random() * characterDialogues.milestones.length)]); 
       }
 
-    // Pass newBalance explicitly to logEvent
-    logEvent('PURCHASE', { 
-      businessId, 
-      businessName: business.name, 
-      cost, 
-      owned: business.owned + 1, 
-      newBalance: newBal, 
-      isFirstOfType: business.owned === 0 
-    }); 
-  }
-};
-   
-  const buyUpgrade = (businessId: string, event?: React.MouseEvent) => { 
-    const business = businesses.find(b => b.id === businessId); 
-    if (!business) return; 
-    const upgradeCost = business.baseCost * 50 * Math.pow(business.upgradeCostMultiplier, business.upgradeLevel);
-    const mouseX = event?.clientX || 0;
-    const mouseY = event?.clientY || 0;
-    
-    if (money >= upgradeCost && business.owned > 0) { 
-      playKachingSound();
-      setMoney(prev => prev - upgradeCost); 
-      setBusinesses(prev => prev.map(b => b.id === businessId ? { ...b, upgradeLevel: b.upgradeLevel + 1 } : b)); 
-      if (Math.random() < 0.3) showDialogue(characterDialogues.upgrades[Math.floor(Math.random() * characterDialogues.upgrades.length)]); 
-      
-      logEvent('UPGRADE', { businessId, businessName: business.name, cost: upgradeCost, upgradeLevel: business.upgradeLevel + 1, newBalance: money - upgradeCost, mouseX, mouseY, reason: 'success' }); 
-    } else {
-      logEvent('UPGRADE_FAILED', { businessId, businessName: business.name, cost: upgradeCost, mouseX, mouseY, reason: money < upgradeCost ? 'insufficient_funds' : 'no_business_owned' });
-    }
-  };
-   
-  const hireManager = (businessId: string, event?: React.MouseEvent) => { 
-    const business = businesses.find(b => b.id === businessId); 
-    if (!business) return; 
-    const mouseX = event?.clientX || 0;
-    const mouseY = event?.clientY || 0;
-    
-    if (money >= business.managerCost && business.owned > 0 && !business.hasManager) { 
-      const isFirstManager = businesses.every(b => !b.hasManager); 
-      setMoney(prev => prev - business.managerCost); 
-      setBusinesses(prev => prev.map(b => b.id === businessId ? { ...b, hasManager: true, isRunning: true } : b)); 
-      
-      if (isFirstManager) { 
-        showDialogue(characterDialogues.firstManager[Math.floor(Math.random() * characterDialogues.firstManager.length)]); 
-        unlockAchievement('first_manager'); 
-      } 
-      
-      logEvent('HIRE_MANAGER', { businessId, businessName: business.name, cost: business.managerCost, newBalance: money - business.managerCost, isFirstManager, totalManagers: businesses.filter(b => b.hasManager).length + 1, mouseX, mouseY, reason: 'success' }); 
-    } else {
-      logEvent('HIRE_MANAGER_FAILED', { businessId, businessName: business.name, cost: business.managerCost, mouseX, mouseY, reason: !business.owned ? 'no_business' : business.hasManager ? 'already_hired' : 'insufficient_funds' });
-    }
-  };
+      const d = rDeadline.current;
+      if (!d) { setTimeLeft(null); return; }
+      const left = d - Date.now();
+      setTimeLeft(left);
+      if (left <= 0) {
+        setDeadline(null); rDeadline.current = null;
+        setTimeLeft(null);
+        punish();
+      }
+    }, 100);
+    return () => clearInterval(id);
+  }, [started, paused]);
 
-  const startProduction = (businessId: string, event?: React.MouseEvent) => { 
-    const business = businesses.find(b => b.id === businessId); 
-    if (!business) return; 
-    const mouseX = event?.clientX || 0;
-    const mouseY = event?.clientY || 0;
-    
-    if (business.owned > 0 && !business.isRunning) {
-      playKachingSound();
-      setBusinesses(prev => prev.map(b => b.id === businessId ? { ...b, isRunning: true, progress: 0 } : b)); 
-      
-      // Check production start count from Ref
-      const productionStarts = eventLogRef.current.filter(e => e.eventType === 'START_PRODUCTION').length; 
-      if (productionStarts >= 49 && !unlockedAchievements.has('speed_demon')) unlockAchievement('speed_demon'); 
-      
-      logEvent('START_PRODUCTION', { businessId, businessName: business.name, expectedRevenue: calculateRevenue(business) * business.owned, cycleTime: calculateTime(business), manualStart: true, hasManager: business.hasManager, owned: business.owned, upgradeLevel: business.upgradeLevel, mouseX, mouseY, reason: 'success' }); 
-    }
-  };
-   
-  const resetGame = () => { 
-    if (window.confirm('Reset and lose all progress? Data will be downloaded.')) { 
-      downloadData(); 
-      // 1. Reset State
-      setMoney(4); 
-      setTotalEarned(0); 
-      setLifetimeEarned(0);
-      setBusinesses(initialBusinesses); 
-      setShowTutorial(true); 
-      setUnlockedAchievements(new Set()); 
-      setAscensionCount(0);
-      setAscensionBonus(1);
-
-      // 2. Fix Ghost Data: Force Reset Refs immediately
-      moneyRef.current = 4;
-      totalEarnedRef.current = 0;
-      lifetimeEarnedRef.current = 0;
-      businessesRef.current = initialBusinesses;
-      
-      // 3. Clear Logs
-      eventLogRef.current = [];
-      setSessionStart(Date.now());
-
-      logEvent('RESET', { finalMoney: money, totalEarned, lifetimeEarned }); 
-    } 
-  };
-   
-  const performAscension = () => {
-    if (canAscend()) {
-      const newBonus = calculateAscensionBonus();
-      const newAscensionCount = ascensionCount + 1;
-      logEvent('ASCENSION', { ascensionNumber: newAscensionCount, lifetimeEarned, newBonus, previousBonus: ascensionBonus });
-      downloadData();
-      
-      // 1. Reset State
-      setMoney(4);
-      setTotalEarned(0);
-      setBusinesses(initialBusinesses);
-      setAscensionCount(newAscensionCount);
-      setAscensionBonus(newBonus);
-      setShowAscensionModal(false);
-
-      // 2. Fix Ghost Data: Force Reset Refs
-      moneyRef.current = 4;
-      totalEarnedRef.current = 0;
-      businessesRef.current = initialBusinesses;
-      
-      // 3. Clear Logs
-      eventLogRef.current = [];
-      setSessionStart(Date.now());
-
-      showDialogue(characterDialogues.ascension[Math.floor(Math.random() * characterDialogues.ascension.length)]);
-      if (newAscensionCount === 1) unlockAchievement('first_ascension');
-      if (newAscensionCount === 5) unlockAchievement('multi_ascension');
-    }
-  };
-   
-const downloadData = () => { 
-  const csvHeader = 'Timestamp,Date/Time,Session Time (ms),Session Time (min),Event Type,User Name,Business ID,Business Name,Cost,Revenue,Owned,Upgrade Level,Current Money,Total Earned,Lifetime Earned,Has Manager,Manual Start,Ascension Count,Ascension Bonus,Total Managers,Is First Purchase,New Balance,Reason\n'; 
-  
-  const csvRows = eventLogRef.current.map(e => {
-    const date = new Date(e.timestamp).toISOString();
-    const sessionMin = (e.sessionTime / 60000).toFixed(3);
-    
-    // Fix: Strictly use e.currentMoney. No fallbacks to live state.
-    return `${e.timestamp},"${date}",${e.sessionTime},${sessionMin},${e.eventType},"${userName}",${e.businessId || ''},${e.businessName || ''},${e.cost || ''},${e.revenue || ''},${e.owned || ''},${e.upgradeLevel || ''},${e.currentMoney},${e.totalEarned},${e.lifetimeEarned},${e.hasManager || false},${e.manualStart || false},${e.ascensionCount},${e.ascensionBonus},${e.totalManagers || ''},${e.isFirstOfType || false},${e.newBalance !== undefined ? e.newBalance : ''},"${e.reason || ''}"`;
-  }).join('\n'); 
-  
-  const csv = csvHeader + csvRows; 
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' }); 
-  const url = window.URL.createObjectURL(blob); 
-  const a = document.createElement('a'); 
-  a.href = url; 
-  a.download = `${userName}_idle_empire_research_${Date.now()}.csv`; 
-  a.click(); 
-};
-   
-  // Fix 4: Stable Game Loop (Ref-based, no dependency tearing)
-  useEffect(() => { 
-    if (!gameStarted || isPaused) return; 
-    
-    const interval = setInterval(() => { 
-        // 1. Read from Refs (Fresh data, no dependency issues)
-        const currentBusinesses = businessesRef.current;
-        let earnedInThisTick = 0;
-        const autoCollectEvents: any[] = [];
-
-        // 2. Logic (Pure calculation)
-        const nextBusinesses = currentBusinesses.map(business => { 
-            if (business.owned === 0 || !business.isRunning) return business; 
-            
-            const cycleTime = calculateTime(business); 
-            // 50ms tick
-            const increment = (100 / cycleTime) * 50; 
-            const newProgress = business.progress + increment; 
-            
-            if (newProgress >= 100) { 
-                const revenue = calculateRevenue(business) * business.owned; 
-                earnedInThisTick += revenue;
-                
-                autoCollectEvents.push({
-                    businessId: business.id, 
-                    businessName: business.name, 
-                    revenue,
-                    hasManager: business.hasManager,
-                    owned: business.owned,
-                    upgradeLevel: business.upgradeLevel,
-                    cycleTime: cycleTime,
-                });
-
-                return { ...business, progress: 0, isRunning: business.hasManager }; 
-            } 
-            return { ...business, progress: newProgress }; 
-        });
-
-        // 3. Batch Update State (Run ONCE per tick)
-        setBusinesses(nextBusinesses);
-
-        if (earnedInThisTick > 0) {
-            setMoney(m => m + earnedInThisTick);
-            setTotalEarned(t => t + earnedInThisTick);
-            setLifetimeEarned(l => l + earnedInThisTick);
-            
-            // 4. Batch Log (Prevents double logs and race conditions)
-            const predictedMoney = moneyRef.current + earnedInThisTick;
-            
-            autoCollectEvents.forEach(evt => {
-                logEvent('AUTO_COLLECT', {
-                   ...evt,
-                   currentMoney: predictedMoney, 
-                   newBalance: predictedMoney
-                });
-            });
+  // ── production loop ──
+  useEffect(() => {
+    if (!started || paused) return;
+    const id = setInterval(() => {
+      let gain = 0;
+      const next = rBiz.current.map(b => {
+        if (b.owned === 0 || !b.isRunning) return b;
+        const inc  = (100 / ctime(b)) * 50;
+        const prog = b.progress + inc;
+        if (prog >= 100) {
+          gain += rev(b) * b.owned;
+          // Managers auto-restart the cycle; manual runs need a fresh "Start"
+          return { ...b, progress: 0, isRunning: b.hasManager };
         }
-        
-    }, 50); 
-    return () => clearInterval(interval); 
-  }, [gameStarted, isPaused]);
+        return { ...b, progress: prog };
+      });
+      setBiz(next); rBiz.current = next;
+      if (gain > 0) {
+        setMoney(m => m + gain);  rMoney.current  += gain;
+        setEarned(e => e + gain); rEarned.current += gain;
+      }
+      setRoiPerSec(calcIPS(next));
+    }, 50);
+    return () => clearInterval(id);
+  }, [started, paused, ascBonus]);
 
-  useEffect(() => { if (!gameStarted) return; if (totalEarned >= 1000000 && !unlockedAchievements.has('millionaire')) unlockAchievement('millionaire'); const totalOwned = businesses.reduce((sum, b) => sum + b.owned, 0); if (totalOwned >= 5 && !unlockedAchievements.has('five_businesses')) unlockAchievement('five_businesses'); const totalUpgrades = businesses.reduce((sum, b) => sum + b.upgradeLevel, 0); if (totalUpgrades >= 10 && !unlockedAchievements.has('ten_upgrades')) unlockAchievement('ten_upgrades'); }, [money, totalEarned, businesses, gameStarted, unlockedAchievements]);
+  // ── player actions ──
+  const buyBiz = id => {
+    const b = rBiz.current.find(x => x.id === id);
+    if (!b) return;
+    const c = cost(b);
+    if (rMoney.current < c) return;
+    const nb          = rMoney.current - c;
+    const isFirstEver = rBiz.current.every(x => x.owned === 0);
+    const nextBizList = rBiz.current.map(x => x.id === id ? { ...x, owned: x.owned + 1 } : x);
 
-  if (!gameStarted) {
-    return (
-      <div className="min-h-screen bg-slate-900 text-white flex items-center justify-center p-4 font-sans">
-        <div className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl p-8 max-w-md w-full">
-          <div className="text-center mb-6">
-            <h1 className="text-4xl font-bold text-white mb-2">💰 Idle Empire 💰</h1>
-            <p className="text-slate-400">Research Edition</p>
-          </div>
-          <div className="mb-6">
-            <label className="block text-slate-300 font-semibold mb-2">Enter Your Name:</label>
-            <input type="text" value={userName} onChange={(e) => setUserName(e.target.value)} className="w-full px-4 py-3 bg-slate-700 border-2 border-slate-600 rounded-lg focus:border-blue-500 focus:outline-none transition" placeholder="Your name here..." />
-          </div>
-          <div className="bg-slate-700/50 p-4 rounded-lg mb-6 text-sm text-slate-300">
-            <h3 className="font-bold mb-2 text-white">🎓 Research Study</h3>
-            <p>This game collects data about your playing patterns. All data will be saved to a CSV file.</p>
-          </div>
-          <button onClick={() => { 
-              if (userName.trim()) { 
-                  // Atomic Start
-                  setMoney(4);
-                  setTotalEarned(0);
-                  setLifetimeEarned(0);
-                  setBusinesses(initialBusinesses);
-                  setGameStarted(true);
-                  
-                  // Force Refs
-                  moneyRef.current = 4;
-                  totalEarnedRef.current = 0;
-                  lifetimeEarnedRef.current = 0;
-                  businessesRef.current = initialBusinesses;
-                  
-                  // Clear Log
-                  eventLogRef.current = [];
-                  setSessionStart(Date.now());
-                  
-                  logEvent('SESSION_START', { userName }); 
-              } else { alert('Please enter your name to begin!'); } 
-          }} className="w-full bg-gradient-to-r from-blue-600 to-purple-600 text-white font-bold py-3 rounded-lg hover:from-blue-700 hover:to-purple-700 transition-transform hover:scale-105">Start Playing! 🚀</button>
+    setMoney(nb); rMoney.current = nb;
+    setBiz(nextBizList); rBiz.current = nextBizList;
+    playKaching();
+    log('PURCHASE', {
+      biz: id, cost: c, newOwned: b.owned + 1,
+      optimalStep: rOptimalStep.current,
+    });
+    checkAction('PURCHASE', id, isFirstEver, nextBizList, nb);
+  };
+
+  const buyUpg = id => {
+    const b = rBiz.current.find(x => x.id === id);
+    if (!b || b.owned === 0) return;
+    const c = b.baseCost * 50 * Math.pow(b.upgCostMul, b.upgradeLevel);
+    if (rMoney.current < c) return;
+    const nb          = rMoney.current - c;
+    const nextBizList = rBiz.current.map(x => x.id === id ? { ...x, upgradeLevel: x.upgradeLevel + 1 } : x);
+
+    setMoney(nb); rMoney.current = nb;
+    setBiz(nextBizList); rBiz.current = nextBizList;
+    playKaching();
+    log('UPGRADE', {
+      biz: id, cost: c, newLevel: b.upgradeLevel + 1,
+      optimalStep: rOptimalStep.current,
+    });
+    checkAction('UPGRADE', id, false, nextBizList, nb);
+  };
+
+  const hireMan = id => {
+    const b = rBiz.current.find(x => x.id === id);
+    if (!b || b.owned === 0 || b.hasManager || rMoney.current < b.mgrCost) return;
+    const nb          = rMoney.current - b.mgrCost;
+    const nextBizList = rBiz.current.map(x => x.id === id ? { ...x, hasManager: true, isRunning: true } : x);
+
+    setMoney(nb); rMoney.current = nb;
+    setBiz(nextBizList); rBiz.current = nextBizList;
+    playKaching();
+    log('HIRE_MANAGER', {
+      biz: id, cost: b.mgrCost,
+      optimalStep: rOptimalStep.current,
+    });
+    checkAction('HIRE_MANAGER', id, false, nextBizList, nb);
+  };
+
+  const startProd = id => {
+    const b = rBiz.current.find(x => x.id === id);
+    if (!b || b.owned === 0 || b.isRunning) return;
+    const nextBizList = rBiz.current.map(x => x.id === id ? { ...x, isRunning: true, progress: 0 } : x);
+    setBiz(nextBizList); rBiz.current = nextBizList;
+    log('START_PROD', { biz: id, optimalStep: rOptimalStep.current });
+  };
+
+  const download = () => {
+    // Explicit cell helpers — never swallow false or 0 via ||
+    const n  = v => (v === undefined || v === null) ? '' : v;
+    const b  = v => (v === undefined || v === null) ? '' : String(v); // booleans as "true"/"false"
+    const r2 = v => (v === undefined || v === null) ? '' : Number(v).toFixed(2);
+
+    const cols = [
+      'Timestamp', 'SessionMs', 'EventType', 'ParticipantName',
+      'Balance', 'TotalEarned', 'IncomePerSec',
+      'Biz', 'Cost', 'NewOwned', 'NewLevel',
+      'Fine', 'BalanceAfter', 'WipeRatio', 'WasDeadlocked',
+      'MissCount', 'CurrentMisses', 'DeadlockStreak', 'TriggerStreak',
+      'FreezeDuration',
+      'OptType', 'OptBiz',
+      'ActualType', 'ActualBiz',
+    ];
+
+    const rows = rLog.current.map(e => [
+      n(e.ts),
+      n(e.sMs),
+      n(e.type),
+      `"${e.name ?? ''}"`,
+      r2(e.money),
+      r2(e.earned),
+      r2(e.ips),
+      n(e.biz),
+      r2(e.cost),
+      n(e.newOwned),
+      n(e.newLevel),
+      r2(e.fine),
+      r2(e.balanceAfter),
+      r2(e.wipeRatio),
+      b(e.wasDeadlocked),
+      n(e.missCount),
+      n(e.currentMisses),
+      n(e.deadlockStreak),
+      n(e.triggerStreak),
+      n(e.freezeDuration),
+      n(e.optimalStep?.type),
+      n(e.optimalStep?.biz),
+      n(e.actualType),
+      n(e.actualBiz),
+    ].join(','));
+
+    const csv = [cols.join(','), ...rows].join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    a.download = `${name}_idle_empire_${Date.now()}.csv`;
+    a.click();
+  };
+
+  // ── derived display ──
+  const warnOn   = botActive && timeLeft !== null && timeLeft <= P.WARN_AT && !isFrozen;
+  const urgency  = timeLeft ? Math.max(0, timeLeft / P.WARN_AT) : 1;
+  const warnClr  = urgency < 0.3 ? '#ef4444' : urgency < 0.65 ? '#f97316' : '#facc15';
+  // Start at 100% once the system is active (first purchase done), then move
+  // up or down as the player matches or misses optimal steps.
+  const accuracy = !botActive ? null
+    : stepsChecked === 0 ? 100
+    : Math.round((correctActions / stepsChecked) * 100);
+
+  // ════════ START SCREEN ════════
+  if (!started) return (
+    <div style={{minHeight:'100vh',background:'#0f172a',display:'flex',alignItems:'center',justifyContent:'center',padding:'1rem',fontFamily:'system-ui,sans-serif'}}>
+      <div style={{background:'#1e293b',border:'1px solid #334155',borderRadius:16,padding:'2rem',maxWidth:400,width:'100%'}}>
+        <h1 style={{color:'#f8fafc',fontSize:26,fontWeight:800,textAlign:'center',margin:'0 0 4px'}}>💰 Idle Empire</h1>
+        <p style={{color:'#475569',textAlign:'center',fontSize:13,margin:'0 0 1.5rem'}}>Research Edition</p>
+
+        <label style={{color:'#cbd5e1',fontSize:14,fontWeight:600,display:'block',marginBottom:6}}>Your name:</label>
+        <input
+          value={name}
+          onChange={e => setName(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') document.getElementById('start-btn').click(); }}
+          placeholder="Enter name..."
+          style={{width:'100%',boxSizing:'border-box',padding:'10px 14px',background:'#0f172a',border:'1.5px solid #334155',borderRadius:8,color:'#f8fafc',fontSize:15,marginBottom:16}}
+        />
+
+        <div style={{background:'#0f172a',borderRadius:8,padding:'1rem',marginBottom:'1.5rem',fontSize:13,color:'#94a3b8',lineHeight:1.75}}>
+          <p style={{fontWeight:700,color:'#fbbf24',margin:'0 0 6px'}}>⚠️ Research Notice</p>
+          <p style={{margin:0}}>
+            This game includes a hidden background evaluation system. You may experience unexpected
+            balance deductions during play. These are intentional and part of the study. All decisions are recorded.
+          </p>
         </div>
+
+        <button
+          id="start-btn"
+          onClick={() => {
+            if (!name.trim()) { alert('Please enter your name!'); return; }
+            const b = freshBiz();
+            setMoney(4);           rMoney.current          = 4;
+            setEarned(0);          rEarned.current         = 0;
+            setBiz(b);             rBiz.current            = b;
+            rLog.current = [];     rSession.current        = Date.now();
+            setMisses(0);          rMisses.current         = 0;
+            setBotActive(false);   rBotActive.current      = false;
+            setDeadline(null);     rDeadline.current       = null;
+            setFreezeUntil(null);  rFreezeUntil.current    = null;
+            setIsFrozen(false);
+            setDeadlockStreak(0);  rDeadlockStreak.current = 0;
+            setOptimalStep(null);  rOptimalStep.current    = null;
+            setFineLog([]); setTotalFines(0);
+            setStepsChecked(0); setCorrectActions(0);
+            setStarted(true); setTutorial(true);
+            log('SESSION_START', { name });
+          }}
+          style={{width:'100%',padding:'12px',background:'#3b82f6',border:'none',borderRadius:8,color:'#fff',fontWeight:700,fontSize:16,cursor:'pointer'}}
+        >
+          Start Playing 🚀
+        </button>
       </div>
-    );
-  }
+    </div>
+  );
 
-  const unlockedAchievementDetails = achievementsList.filter(ach => unlockedAchievements.has(ach.id));
-
-  // GLOBAL INCOME PER SECOND (sum of all businesses)
-  const incomePerSecond = businesses.reduce((total, b) => {
-  // income only counts if a manager is hired
-  if (b.owned === 0 || !b.hasManager) return total;
-
-  const revenue = calculateRevenue(b) * b.owned;
-  const cycleTimeSec = calculateTime(b) / 1000;
-
-  return total + revenue / cycleTimeSec;
-}, 0);
-
+  // ════════ MAIN GAME ════════
   return (
     <>
-    <style>{`
-      @keyframes soft-popup { 
-        from { opacity: 0; transform: translateY(20px); } 
-        to { opacity: 1; transform: translateY(0); } 
-      } 
-      .animate-soft-popup { 
-        animation: soft-popup 0.5s ease-out forwards; 
-      }
-      
-      /* Business Animations */
-      @keyframes fill-jug {
-        0% { transform: scaleY(0); transform-origin: bottom; }
-        100% { transform: scaleY(1); transform-origin: bottom; }
-      }
-      @keyframes open-newspaper {
-        0% { transform: rotateY(0deg); }
-        50% { transform: rotateY(90deg); }
-        100% { transform: rotateY(180deg); }
-      }
-      @keyframes spin-wheels {
-        from { transform: rotate(0deg); }
-        to { transform: rotate(360deg); }
-      }
-      @keyframes deliver-pizza {
-        0%, 100% { transform: translateX(0); }
-        50% { transform: translateX(10px); }
-      }
-      @keyframes flash-arcade {
-        0%, 100% { opacity: 1; filter: brightness(1); }
-        50% { opacity: 0.7; filter: brightness(1.5); }
-      }
-      @keyframes play-movie {
-        0%, 100% { transform: scale(1); }
-        50% { transform: scale(1.1); }
-      }
-      @keyframes count-money {
-        0%, 100% { transform: translateY(0); }
-        50% { transform: translateY(-5px); }
-      }
-      @keyframes pump-oil {
-        0%, 100% { transform: translateY(0) scaleY(1); }
-        50% { transform: translateY(-3px) scaleY(0.95); }
-      }
-      @keyframes fly-plane {
-        0% { transform: translateX(-10px) translateY(5px); }
-        50% { transform: translateX(10px) translateY(-5px); }
-        100% { transform: translateX(-10px) translateY(5px); }
-      }
-      @keyframes orbit-space {
-        from { transform: rotate(0deg) translateX(5px) rotate(0deg); }
-        to { transform: rotate(360deg) translateX(5px) rotate(-360deg); }
-      }
-      
-      .animate-lemonade { animation: fill-jug 2s ease-in-out infinite; }
-      .animate-newspaper { animation: open-newspaper 3s ease-in-out infinite; }
-      .animate-carwash { animation: spin-wheels 1.5s linear infinite; }
-      .animate-pizza { animation: deliver-pizza 2s ease-in-out infinite; }
-      .animate-arcade { animation: flash-arcade 1s ease-in-out infinite; }
-      .animate-cinema { animation: play-movie 2.5s ease-in-out infinite; }
-      .animate-bank { animation: count-money 1.8s ease-in-out infinite; }
-      .animate-oilrig { animation: pump-oil 2s ease-in-out infinite; }
-      .animate-airline { animation: fly-plane 4s ease-in-out infinite; }
-      .animate-spacestation { animation: orbit-space 5s linear infinite; }
-    `}</style>
-    <div className="min-h-screen bg-slate-100 font-sans p-4 sm:p-6 lg:p-8">
-      <div className="fixed bottom-4 left-4 z-40 space-y-2 max-w-sm">
-        {dialogues.map(dialogue => (<div key={dialogue.id} className="bg-white rounded-xl shadow-2xl p-4 border-l-4 border-amber-400 animate-soft-popup"><div className="flex items-start gap-3"><div className="text-3xl mt-1">🤵</div><p className="text-slate-700 font-medium text-sm">{dialogue.message}</p></div></div>))}
-      </div>
-      <div className="fixed top-4 right-4 z-40 space-y-2 max-w-sm">
-        {achievements.map(achievement => (<div key={achievement.id} className="bg-gradient-to-br from-purple-600 to-blue-600 text-white rounded-xl shadow-2xl p-4 border-2 border-yellow-300 animate-soft-popup"><div className="flex items-center gap-3"><div className="text-4xl">{achievement.icon}</div><div className="flex-1"><p className="font-bold text-lg">Achievement Unlocked!</p><p className="font-semibold">{achievement.name}</p><p className="text-xs opacity-90">{achievement.description}</p></div></div></div>))}
-      </div>
-      
-      {showTutorial && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={() => setShowTutorial(false)}>
-          <div className="bg-white rounded-2xl p-6 max-w-lg w-full" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-2xl font-bold mb-4 text-gray-800">Welcome, {userName}! 👋</h2>
-            <div className="space-y-3 text-gray-700 mb-6"><p>🎯 <strong>Goal:</strong> Build an empire and reach ascension!</p><p>💡 <strong>How to play:</strong></p><ul className="list-disc ml-6 space-y-1"><li>Buy businesses to earn money</li><li>Click Start to begin production</li><li>Money auto-collects when progress fills</li><li>Hire managers to automate</li><li>Upgrade for efficiency</li><li>Reach milestones (10, 25, 50, etc.) for big bonuses!</li><li>Progress is SLOW - strategic choices matter!</li></ul><p>📊 All decisions are tracked for research.</p></div>
-            <button onClick={() => setShowTutorial(false)} className="w-full bg-gradient-to-r from-green-500 to-blue-500 text-white font-bold py-3 rounded-lg hover:from-green-600 hover:to-blue-600">Let's Go! 🚀</button>
-          </div>
-        </div>
-      )}
-      
-      {showAscensionModal && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setShowAscensionModal(false)}>
-          <div className="bg-gradient-to-br from-purple-900 to-blue-900 text-white rounded-2xl p-8 max-w-lg w-full border-4 border-yellow-400" onClick={(e) => e.stopPropagation()}>
-            <div className="text-center mb-6">
-              <div className="text-6xl mb-4">🌟</div>
-              <h2 className="text-3xl font-bold mb-2">ASCENSION</h2>
-              <p className="text-purple-200">Transcend your reality</p>
-            </div>
-            
-            <div className="bg-black/30 rounded-lg p-4 mb-6 space-y-3">
-              <div className="flex justify-between items-center">
-                <span className="text-purple-200">Required Lifetime:</span>
-                <span className="text-xl font-bold text-yellow-400">${calculateAscensionCost().toExponential(2)}</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-purple-200">Your Lifetime:</span>
-                <span className="text-xl font-bold text-cyan-400">${lifetimeEarned.toExponential(2)}</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-purple-200">Current Bonus:</span>
-                <span className="text-xl font-bold text-green-400">{ascensionBonus.toFixed(1)}x</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-purple-200">New Bonus:</span>
-                <span className="text-xl font-bold text-pink-400">{calculateAscensionBonus().toFixed(1)}x</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-purple-200">Ascensions:</span>
-                <span className="text-xl font-bold">{ascensionCount}</span>
-              </div>
-            </div>
-            
-            <div className="bg-red-900/50 rounded-lg p-4 mb-6">
-              <p className="text-sm text-yellow-200"><strong>⚠️ Warning:</strong> Resets all businesses, upgrades, managers. You keep ascension bonus and start with $4.</p>
-            </div>
-            
-            <div className="flex gap-3">
-              <button onClick={() => setShowAscensionModal(false)} className="flex-1 bg-gray-700 text-white font-bold py-3 rounded-lg hover:bg-gray-600 transition">Cancel</button>
-              <button onClick={performAscension} disabled={!canAscend()} className="flex-1 bg-gradient-to-r from-yellow-500 to-orange-500 text-white font-bold py-3 rounded-lg hover:from-yellow-600 hover:to-orange-600 transition disabled:opacity-50 disabled:cursor-not-allowed">Ascend! ✨</button>
-            </div>
-          </div>
-        </div>
-      )}
-      
-      <div className="max-w-7xl mx-auto">
-        <header className="bg-slate-800 text-white rounded-2xl shadow-lg p-5 mb-8 sticky top-4 z-30">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="flex-shrink-0"><h1 className="text-2xl font-bold tracking-tight">Idle Empire</h1><p className="text-sm text-slate-400">Player: {userName}</p></div>
-            <div className="flex items-center gap-3 sm:gap-4 flex-grow justify-center">
-              <div className="text-center"><p className="text-sm font-medium text-slate-400">Balance</p><p className="text-2xl sm:text-3xl font-bold text-green-400">${money.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 3})}</p></div>
-              <div className="border-l border-slate-600 h-10"></div>
-              <div className="text-center"><p className="text-sm font-medium text-slate-400">Lifetime</p><p className="text-lg sm:text-xl font-semibold text-cyan-400">${lifetimeEarned.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 3})}</p></div>
-              {ascensionBonus > 1 && (
-                <>
-                  <div className="border-l border-slate-600 h-10"></div>
-                  <div className="text-center"><p className="text-sm font-medium text-slate-400">Bonus</p><p className="text-lg sm:text-xl font-semibold text-purple-400">{ascensionBonus.toFixed(1)}x</p></div>
-                </>
-              )}
-              <div className="border-l border-slate-600 h-10"></div>
-              <div className="text-center">
-                <p className="text-sm font-medium text-slate-400">Income/sec</p>
-                <p className="text-lg sm:text-xl font-semibold text-amber-500">
-                  ${incomePerSecond.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
-                </p>
-              </div>
+      <style>{`
+        @keyframes fadeup    { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
+        @keyframes shake     { 0%,100%{transform:translateX(0)} 20%,60%{transform:translateX(-8px)} 40%,80%{transform:translateX(8px)} }
+        @keyframes pulse     { 0%,100%{opacity:1} 50%{opacity:0.45} }
+        @keyframes borderFl  { 0%,100%{box-shadow:0 0 0 2px #ef4444} 50%{box-shadow:0 0 0 2px #fca5a5,0 0 18px #ef444466} }
+        @keyframes frozenP   { 0%,100%{box-shadow:0 0 0 2px #38bdf8} 50%{box-shadow:0 0 0 2px #7dd3fc,0 0 18px #38bdf866} }
+        @keyframes iceShim   { 0%,100%{opacity:0.7} 50%{opacity:1} }
+        .fadeup      { animation: fadeup 0.3s ease forwards }
+        .shaking     { animation: shake 0.45s ease }
+        .pulsing     { animation: pulse 0.7s ease infinite }
+        .flicker     { animation: borderFl 0.55s ease infinite }
+        .frozen-ring { animation: frozenP 1.2s ease infinite }
+        .ice-blink   { animation: iceShim 2s ease infinite }
+      `}</style>
 
-            </div>
-            <div className="flex gap-2">
-              <button onClick={() => setIsPaused(!isPaused)} className="p-3 bg-slate-700 rounded-lg hover:bg-slate-600 transition" title={isPaused ? "Resume" : "Pause"}>{isPaused ? <Play size={20} /> : <Pause size={20} />}</button>
-              <button onClick={() => { logEvent('BUTTON_CLICK', { button: 'download', action: 'download_data' }); downloadData(); }} className="p-3 bg-slate-700 rounded-lg hover:bg-slate-600 transition" title="Download Data"><Download size={20} /></button>
-              <button onClick={() => { logEvent('BUTTON_CLICK', { button: 'ascension_open', canAscend: canAscend() }); setShowAscensionModal(true); }} disabled={!canAscend()} className="p-3 bg-purple-700 rounded-lg hover:bg-purple-600 transition disabled:opacity-50 disabled:cursor-not-allowed" title="Ascension"><Sparkles size={20} /></button>
-              <button onClick={() => { logEvent('BUTTON_CLICK', { button: 'reset', action: 'reset_attempt' }); resetGame(); }} className="p-3 bg-red-700/50 text-red-300 rounded-lg hover:bg-red-700/80 hover:text-white transition" title="Reset Game"><RotateCcw size={20} /></button>
+      <div className={shake ? 'shaking' : ''} style={{minHeight:'100vh',background:'#f1f5f9',fontFamily:'system-ui,sans-serif',padding:'0.75rem'}}>
+
+        {/* penalty flash */}
+        {flashMsg && (
+          <div className="fadeup" style={{
+            position:'fixed',top:'42%',left:'50%',transform:'translate(-50%,-50%)',
+            zIndex:80,background:'#1e293b',border:`2px solid ${flashMsg.color}`,
+            borderRadius:14,padding:'1.25rem 2rem',textAlign:'center',
+            color:'#f8fafc',maxWidth:340,pointerEvents:'none',
+            boxShadow:'0 8px 40px rgba(0,0,0,0.45)'
+          }}>
+            <div style={{fontSize:30,marginBottom:6}}>💸</div>
+            <div style={{fontWeight:700,fontSize:16,color:'#fca5a5'}}>{flashMsg.msg}</div>
+          </div>
+        )}
+
+        {/* tutorial */}
+        {tutorial && (
+          <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.72)',zIndex:60,display:'flex',alignItems:'center',justifyContent:'center',padding:'1rem'}}>
+            <div style={{background:'#fff',borderRadius:16,padding:'2rem',maxWidth:460,width:'100%'}}>
+              <h2 style={{margin:'0 0 0.75rem',fontSize:20}}>Welcome, {name}! 👋</h2>
+              <p style={{color:'#374151',lineHeight:1.7,margin:'0 0 0.75rem'}}>
+                Buy businesses, start production, hire managers, upgrade — build your empire.
+              </p>
+              <p style={{color:'#374151',lineHeight:1.7,margin:'0 0 0.75rem'}}>
+                A background system is watching your session. You will sometimes see <strong style={{color:'#ef4444'}}>unexpected deductions</strong> from your balance. This is not a bug. Figure out what the system wants.
+              </p>
+              <p style={{color:'#94a3b8',fontSize:13,margin:'0 0 1.25rem'}}>All actions are recorded for research purposes.</p>
+              <button onClick={() => setTutorial(false)}
+                style={{width:'100%',padding:'11px',background:'#1e293b',border:'none',borderRadius:8,color:'#fff',fontWeight:700,fontSize:15,cursor:'pointer'}}>
+                Got it — let's go 🚀
+              </button>
             </div>
           </div>
+        )}
+
+        {/* header */}
+        <header
+          className={isFrozen ? 'frozen-ring' : warnOn ? 'flicker' : ''}
+          style={{
+            background:'#1e293b',color:'#fff',borderRadius:14,
+            padding:'1rem 1.25rem',marginBottom:'1.25rem',
+            position:'sticky',top:8,zIndex:30,
+            boxShadow:'0 4px 20px rgba(0,0,0,0.25)',
+          }}>
+          <div style={{display:'flex',alignItems:'center',flexWrap:'wrap',gap:14}}>
+            <div style={{flexShrink:0}}>
+              <div style={{fontWeight:700,fontSize:17}}>Idle Empire</div>
+              <div style={{fontSize:12,color:'#64748b'}}>{name}</div>
+            </div>
+            <div style={{display:'flex',gap:20,flex:1,justifyContent:'center',flexWrap:'wrap',alignItems:'center'}}>
+              <StatBox label="Balance"   value={fmt(money)}      color="#4ade80" large />
+              <StatBox label="Income/s"  value={fmt(roiPerSec)}  color="#fbbf24" />
+              <StatBox label="Total"     value={fmt(earned)}     color="#60a5fa" />
+              <StatBox label="Fined"     value={fmt(totalFines)} color="#f87171" />
+              <StatBox label="Penalties" value={fineLog.length}  color="#fb923c" />
+              {accuracy !== null && <StatBox label="Accuracy" value={`${accuracy}%`} color="#a78bfa" />}
+            </div>
+            <div style={{display:'flex',gap:8,flexShrink:0}}>
+              <IcnBtn onClick={() => setPaused(p => !p)} title={paused ? 'Resume' : 'Pause'}>
+                {paused
+                  ? <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                  : <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>}
+              </IcnBtn>
+              <IcnBtn onClick={() => download()} title="Download data">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+              </IcnBtn>
+            </div>
+          </div>
+
+          {/* tension bar */}
+          {botActive && deadline && (
+            <div style={{marginTop:12,display:'flex',alignItems:'center',gap:10}}>
+              <div style={{flex:1,height:5,background:'#0f172a',borderRadius:3,overflow:'hidden',border:'1px solid #334155'}}>
+                {isFrozen ? (
+                  <div className="ice-blink" style={{
+                    height:'100%',borderRadius:3,background:'#38bdf8',
+                    width:`${Math.max(0,Math.min(100,(timeLeft ?? P.WINDOW)/P.WINDOW*100))}%`,
+                  }}/>
+                ) : (
+                  <div style={{
+                    height:'100%',borderRadius:3,
+                    background: warnOn ? warnClr : '#3b82f6',
+                    width:`${Math.max(0,Math.min(100,(timeLeft ?? P.WINDOW)/P.WINDOW*100))}%`,
+                    transition:'width 0.1s linear, background 0.3s'
+                  }}/>
+                )}
+              </div>
+              {isFrozen ? (
+                <span className="ice-blink" style={{color:'#38bdf8',fontWeight:800,fontSize:14,minWidth:50,textAlign:'right'}}>
+                  ❄️ {((timeLeft ?? 0)/1000).toFixed(1)}s
+                </span>
+              ) : warnOn ? (
+                <span className="pulsing" style={{color:warnClr,fontWeight:800,fontSize:15,minWidth:40,textAlign:'right'}}>
+                  {((timeLeft ?? 0)/1000).toFixed(1)}s
+                </span>
+              ) : null}
+            </div>
+          )}
         </header>
-        <main className="grid grid-cols-1 lg:grid-cols-3 lg:gap-8">
-          <div className="lg:col-span-2 grid gap-5">
-            {businesses.map((business) => {
-              const cost = calculateCost(business);
-              const revenue = calculateRevenue(business);
-              const upgradeCost = business.baseCost * 50 * Math.pow(business.upgradeCostMultiplier, business.upgradeLevel);
-              const canAfford = money >= cost;
-              const canUpgrade = money >= upgradeCost && business.owned > 0;
-              const canHireManager = money >= business.managerCost && business.owned > 0 && !business.hasManager;
-              const totalRevenue = revenue * business.owned;
-              const revenuePerSecond = business.owned > 0 ? totalRevenue / (calculateTime(business) / 1000) : 0;
-              
-              // Determine animation class
-              const getAnimationClass = () => {
-                if (!business.isRunning || business.owned === 0) return '';
-                const animations: Record<string, string> = {
-                  lemonade: 'animate-lemonade',
-                  newspaper: 'animate-newspaper',
-                  carwash: 'animate-carwash',
-                  pizza: 'animate-pizza',
-                  arcade: 'animate-arcade',
-                  cinema: 'animate-cinema',
-                  bank: 'animate-bank',
-                  oilrig: 'animate-oilrig',
-                  airline: 'animate-airline',
-                  spacestation: 'animate-spacestation'
-                };
-                return animations[business.id] || '';
-              };
-              
+
+        {/* main grid */}
+        <div style={{display:'grid',gridTemplateColumns:'1fr 270px',gap:'1.25rem'}}>
+
+          {/* businesses */}
+          <div style={{display:'flex',flexDirection:'column',gap:12}}>
+            {biz.map(b => {
+              const c    = cost(b);
+              const r    = rev(b);
+              const uc   = b.baseCost * 50 * Math.pow(b.upgCostMul, b.upgradeLevel);
+              const canB = money >= c;
+              const canU = money >= uc && b.owned > 0;
+              const canM = money >= b.mgrCost && b.owned > 0 && !b.hasManager;
               return (
-                <div key={business.id} className="bg-white/80 backdrop-blur-sm rounded-xl shadow-md p-4 transition-all duration-300">
-                  <div className="flex items-center gap-4">
-                    <div className={`text-5xl flex-shrink-0 w-16 h-16 flex items-center justify-center bg-slate-100 rounded-lg ${getAnimationClass()}`}>{business.icon}</div>
-                    <div className="flex-1">
-                      <div className="flex justify-between items-start">
+                <div key={b.id} style={{background:'#fff',borderRadius:14,padding:'1rem',border:'1px solid #e2e8f0',boxShadow:'0 1px 4px rgba(0,0,0,0.04)'}}>
+                  <div style={{display:'flex',gap:12,alignItems:'flex-start'}}>
+                    <div style={{fontSize:36,lineHeight:1,flexShrink:0,width:50,height:50,display:'flex',alignItems:'center',justifyContent:'center',background:'#f8fafc',borderRadius:10}}>{b.icon}</div>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:8}}>
                         <div>
-                          <h3 className="text-lg font-bold text-slate-800">{business.name}</h3>
-                          <p className="text-xs text-slate-500">{business.description}</p>
-                          {business.owned > 0 && (
-                            <div className="mt-1 space-y-0.5">
-                              <p className="text-xs font-semibold text-green-600">
-                                💰 ${totalRevenue.toLocaleString()} per cycle
-                              </p>
-                              <p className="text-xs font-semibold text-blue-600">
-                                ⚡ ${revenuePerSecond.toFixed(3)}/sec
-                              </p>
+                          <div style={{fontWeight:700,fontSize:15,color:'#1e293b'}}>{b.name}</div>
+                          {b.owned > 0 && (
+                            <div style={{fontSize:12,marginTop:2}}>
+                              <span style={{fontWeight:600,color:'#16a34a'}}>💰 {fmt(r*b.owned)}/cycle</span>
+                              {b.hasManager && <span style={{color:'#2563eb',marginLeft:8}}>⚡ {fmt((r*b.owned)/(ctime(b)/1000))}/s</span>}
                             </div>
                           )}
                         </div>
-                        <div className="text-right flex-shrink-0 pl-2"><p className="text-2xl font-bold text-slate-800">{business.owned}</p><p className="text-xs text-slate-500 -mt-1">Owned</p></div>
+                        <div style={{textAlign:'right',flexShrink:0}}>
+                          <div style={{fontSize:22,fontWeight:800,color:'#0f172a'}}>{b.owned}</div>
+                          <div style={{fontSize:10,color:'#94a3b8'}}>owned</div>
+                          {b.upgradeLevel > 0 && <div style={{fontSize:10,color:'#7c3aed'}}>Lv{b.upgradeLevel}</div>}
+                          {b.hasManager && <div style={{fontSize:10,color:'#0891b2'}}>👔</div>}
+                        </div>
                       </div>
-                      {business.owned > 0 && (
-                        <div className="mt-2">
-                          <div className="bg-slate-200 rounded-full h-5 overflow-hidden relative group"><div className="bg-green-500 h-full transition-all duration-100" style={{ width: `${Math.min(business.progress, 100)}%` }}></div><div className="absolute inset-0 flex items-center justify-center text-xs font-bold text-white drop-shadow-sm pointer-events-none">{business.isRunning ? `${(revenue * business.owned).toLocaleString()} / ${(calculateTime(business)/1000).toFixed(3
-                          )}s` : "Idle"}</div></div>
+                      {b.owned > 0 && (
+                        <div style={{marginTop:8,background:'#f1f5f9',borderRadius:999,height:14,overflow:'hidden',position:'relative'}}>
+                          <div style={{width:`${Math.min(b.progress,100)}%`,height:'100%',background:'#22c55e',transition:'width 0.1s'}}/>
+                          <span style={{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:600,color:'#374151'}}>
+                            {b.isRunning ? `${(ctime(b)/1000).toFixed(1)}s` : 'Idle'}
+                          </span>
                         </div>
                       )}
                     </div>
                   </div>
-                  <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-2">
-                    {business.owned === 0 ? (
-                      <button 
-                        onClick={() => buyBusiness(business.id)} 
-                        disabled={!canAfford} 
-                        className={`col-span-full py-3 px-4 flex items-center justify-center gap-2 rounded-lg font-bold transition ${
-                          canAfford 
-                            ? 'bg-green-500 text-white hover:bg-green-600 shadow-lg' 
-                            : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                        }`}
-                      >
-                        <Plus size={16} /> Buy for ${cost.toLocaleString()}
-                      </button>
-                    ) : (
-                      <>
-                        <button 
-                          onClick={() => startProduction(business.id)} 
-                          disabled={business.isRunning || business.hasManager} 
-                          className={`py-2 px-3 flex items-center justify-center gap-2 rounded-lg font-bold transition text-sm ${
-                            (!business.isRunning && !business.hasManager)
-                              ? 'bg-blue-500 text-white hover:bg-blue-600 shadow-md'
-                              : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                          }`}
-                        >
-                          {business.hasManager ? <User size={16}/> : <Play size={16}/>} 
-                          {business.hasManager ? 'Managed' : (business.isRunning ? 'Running' : 'Start')}
-                        </button>
-                        <button 
-                          onClick={() => buyBusiness(business.id)} 
-                          disabled={!canAfford} 
-                          className={`py-2 px-3 flex items-center justify-center gap-2 rounded-lg font-bold transition text-sm ${
-                            canAfford 
-                              ? 'bg-green-500 text-white hover:bg-green-600 shadow-md' 
-                              : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                          }`}
-                        >
-                          <Plus size={16} /> ${cost.toLocaleString()}
-                        </button>
-                        <button 
-                          onClick={() => buyUpgrade(business.id)} 
-                          disabled={!canUpgrade} 
-                          className={`py-2 px-3 flex items-center justify-center gap-2 rounded-lg font-bold transition text-sm ${
-                            canUpgrade 
-                              ? 'bg-purple-500 text-white hover:bg-purple-600 shadow-md' 
-                              : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                          }`}
-                        >
-                          <TrendingUp size={16} /> ${upgradeCost.toLocaleString()}
-                        </button>
-                        <button 
-                          onClick={() => hireManager(business.id)} 
-                          disabled={!canHireManager || business.hasManager} 
-                          className={`py-2 px-3 flex items-center justify-center gap-2 rounded-lg font-bold transition text-sm ${
-                            canHireManager 
-                              ? 'bg-teal-500 text-white hover:bg-teal-600 shadow-md' 
-                              : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                          }`}
-                        >
-                          <Crown size={16} /> ${business.managerCost.toLocaleString()}
-                        </button>
-                      </>
-                    )}
+                  <div style={{marginTop:10,display:'grid',gridTemplateColumns: b.owned===0 ? '1fr' : 'repeat(4,1fr)',gap:6}}>
+                    {b.owned === 0 ? (
+                      <Btn active={canB} onClick={() => buyBiz(b.id)} col={canB?'#16a34a':'#e2e8f0'} tcol={canB?'#fff':'#94a3b8'}>+ Buy {fmt(c)}</Btn>
+                    ) : (<>
+                      <Btn active={!b.isRunning && !b.hasManager} onClick={() => startProd(b.id)} col={(!b.isRunning && !b.hasManager)?'#2563eb':'#e2e8f0'} tcol={(!b.isRunning && !b.hasManager)?'#fff':'#94a3b8'}>
+                        {b.hasManager ? '👔' : b.isRunning ? '▶ Running' : '▶ Start'}
+                      </Btn>
+                      <Btn active={canB} onClick={() => buyBiz(b.id)} col={canB?'#16a34a':'#e2e8f0'} tcol={canB?'#fff':'#94a3b8'}>+ {fmt(c)}</Btn>
+                      <Btn active={canU} onClick={() => buyUpg(b.id)} col={canU?'#7c3aed':'#e2e8f0'} tcol={canU?'#fff':'#94a3b8'}>↑ {fmt(uc)}</Btn>
+                      <Btn active={canM} onClick={() => hireMan(b.id)} col={canM?'#0891b2':'#e2e8f0'} tcol={canM?'#fff':'#94a3b8'}>👔 {fmt(b.mgrCost)}</Btn>
+                    </>)}
                   </div>
                 </div>
               );
             })}
           </div>
-          <aside className="lg:col-span-1 space-y-6 mt-6 lg:mt-0">
-            <aside className="lg:col-span-1 space-y-6 mt-6 lg:mt-0">
-            
-            {/* 1. EMPIRE SUMMARY (Now on Top) */}
-            <div className="bg-white/80 backdrop-blur-sm rounded-xl shadow-md p-5 sticky top-28">
-              <h3 className="text-lg font-bold text-slate-800 border-b pb-2 mb-3 flex items-center gap-2"><Building2 size={20}/> Empire Summary</h3>
-              {businesses.filter(b => b.owned > 0).length > 0 ? (<ul className="space-y-2 text-sm">{businesses.filter(b => b.owned > 0).map(b => (<li key={b.id} className="flex justify-between items-center text-slate-600"><span className="font-medium flex items-center gap-2">{b.icon} {b.name}</span><span className="font-bold text-slate-800">x{b.owned}</span></li>))}</ul>) : (<p className="text-sm text-slate-500 text-center py-4">Buy a business to start!</p>)}
-            </div>
 
-            {/* 2. ACHIEVEMENTS (Now on Bottom) */}
-            {/* Changed top-28 to top-80 so it sticks below the summary */}
-            <div className="bg-white/80 backdrop-blur-sm rounded-xl shadow-md p-5 sticky top-80">
-              <h3 className="text-lg font-bold text-slate-800 border-b pb-2 mb-3 flex items-center gap-2"><Target size={20}/> Achievements</h3>
-              {unlockedAchievementDetails.length > 0 ? (<ul className="space-y-3 max-h-60 overflow-y-auto pr-2">{unlockedAchievementDetails.map(ach => (<li key={ach.id} className="flex items-center gap-3 bg-slate-100 p-2 rounded-lg"><span className="text-3xl">{ach.icon}</span><div><p className="font-bold text-sm text-slate-700">{ach.name}</p><p className="text-xs text-slate-500">{ach.description}</p></div></li>))}</ul>) : (<p className="text-sm text-slate-500 text-center py-4">No achievements yet. Keep going!</p>)}
+          {/* sidebar */}
+          <div style={{display:'flex',flexDirection:'column',gap:12}}>
+            <div style={{background:'#1e293b',borderRadius:14,padding:'1rem',border:'1px solid #334155',position:'sticky',top:100}}>
+              <div style={{fontWeight:700,fontSize:14,color:'#e2e8f0',marginBottom:10,display:'flex',alignItems:'center',gap:6}}>
+                <span style={{color:'#f87171',fontSize:16}}>⚡</span> System Log
+              </div>
+              {fineLog.length === 0 ? (
+                <p style={{color:'#475569',fontSize:12,textAlign:'center',padding:'0.5rem 0'}}>No events yet.</p>
+              ) : (
+                <div style={{display:'flex',flexDirection:'column',gap:4,maxHeight:260,overflowY:'auto'}}>
+                  {[...fineLog].reverse().map((e,i) => (
+                    <div key={i} style={{background:'#0f172a',borderRadius:8,padding:'6px 10px',border:'1px solid #1e293b'}}>
+                      <div style={{fontSize:12,color:'#f87171',fontWeight:700}}>−{fmt(e.fine)}</div>
+                      <div style={{fontSize:11,color:'#475569'}}>miss #{e.m} · {new Date(e.ts).toLocaleTimeString()}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{marginTop:10,paddingTop:8,borderTop:'1px solid #1e293b',display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+                {[
+                  ['Total fined',  fmt(totalFines), '#f87171'],
+                  ['Penalties',    fineLog.length,  '#fb923c'],
+                  ['Consec. miss', misses,          '#facc15'],
+                  ['Accuracy',     accuracy !== null ? `${accuracy}%` : '—', '#a78bfa'],
+                ].map(([l,v,c]) => (
+                  <div key={l} style={{background:'#0f172a',borderRadius:8,padding:'6px 8px'}}>
+                    <div style={{fontSize:10,color:'#475569'}}>{l}</div>
+                    <div style={{fontSize:14,fontWeight:700,color:c}}>{v}</div>
+                  </div>
+                ))}
+              </div>
             </div>
-
-          </aside>
-            
-          </aside>
-        </main>
+            <div style={{background:'#fff',borderRadius:14,padding:'1rem',border:'1px solid #e2e8f0'}}>
+              <div style={{fontWeight:700,fontSize:14,color:'#1e293b',marginBottom:8}}>🏢 Empire</div>
+              {biz.filter(b=>b.owned>0).length === 0
+                ? <p style={{color:'#94a3b8',fontSize:12,textAlign:'center',padding:'0.5rem 0'}}>Buy a business to start!</p>
+                : biz.filter(b=>b.owned>0).map(b => (
+                    <div key={b.id} style={{display:'flex',justifyContent:'space-between',fontSize:13,marginBottom:5,color:'#374151'}}>
+                      <span>{b.icon} {b.name}</span>
+                      <span style={{fontWeight:700,color:'#0f172a'}}>×{b.owned}</span>
+                    </div>
+                  ))
+              }
+            </div>
+          </div>
+        </div>
       </div>
-    </div>
     </>
   );
-};
-export default IdleEmpireGame;
+}
+
+const StatBox = ({label,value,color,large}) => (
+  <div style={{textAlign:'center'}}>
+    <div style={{fontSize:10,color:'#94a3b8',textTransform:'uppercase',letterSpacing:0.5}}>{label}</div>
+    <div style={{fontSize: large ? 20 : 15,fontWeight:800,color}}>{value}</div>
+  </div>
+);
+
+const IcnBtn = ({children,onClick,title}) => (
+  <button onClick={onClick} title={title}
+    style={{padding:'8px 10px',background:'#334155',border:'none',borderRadius:8,color:'#e2e8f0',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>
+    {children}
+  </button>
+);
+
+const Btn = ({children,onClick,active,col,tcol}) => (
+  <button onClick={active ? onClick : undefined}
+    style={{
+      padding:'7px 4px',borderRadius:8,border:'none',fontWeight:600,fontSize:12,lineHeight:1.2,
+      cursor: active ? 'pointer' : 'not-allowed',
+      background: col, color: tcol,
+      display:'flex',alignItems:'center',justifyContent:'center',gap:3,
+      transition:'opacity 0.15s', opacity: active ? 1 : 0.85,
+    }}>
+    {children}
+  </button>
+);
