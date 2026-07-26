@@ -1,4 +1,15 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type ReactNode, type ChangeEvent, type KeyboardEvent } from 'react';
+
+// ── shared types ──
+type Biz = {
+  id: string; name: string; baseCost: number; baseRev: number; baseTime: number;
+  icon: string; costMul: number; upgBonus: number; mgrCost: number; upgCostMul: number;
+  owned: number; progress: number; isRunning: boolean; upgradeLevel: number; hasManager: boolean;
+};
+type OptimalStep = { type: string; biz: string; cost: number; score: number; affordable: boolean } | null;
+type FineLogEntry = { fine: number; m: number; ts: number; step: OptimalStep };
+type FlashMsg = { msg: string; color: string } | null;
+type LogEvent = Record<string, any>;
 
 // ── business definitions ──
 const BIZ_TYPES = [
@@ -20,7 +31,7 @@ const P = {
   WARN_AT: 6000,            // ms left when warning bar turns orange/red
   BASE: 0.05,               // 5% of balance per miss
   SCALE: 1.5,               // exponential escalation factor
-  MAX_EXP: 7,               // exponent cap
+  MAX_EXP: 6,               // exponent cap
   FREEZE_AFTER: 3,          // consecutive deadlock-wipe rounds before freeze
   DEADLOCK_WIPE_FRAC: 0.95, // punishment must wipe >= this fraction of balance to count
   FREEZE_DURATION: 20000,   // how long a freeze lasts (ms)
@@ -37,7 +48,7 @@ const P = {
 //  calcIPS(), isInDeadlock(), and the freeze system, so they all
 //  agree on the player's actual current income.
 // ════════════════════════════════════════════════════════════
-function effectiveIncomePerSec(b, ascBonus) {
+function effectiveIncomePerSec(b: Biz, ascBonus: number): number {
   if (b.owned === 0) return 0;
 
   let r = b.baseRev * Math.pow(b.upgBonus, b.upgradeLevel);
@@ -72,7 +83,7 @@ function effectiveIncomePerSec(b, ascBonus) {
 //  that's currently unaffordable can still be "optimal" if the time
 //  needed to save up for it is small relative to its payoff.
 // ════════════════════════════════════════════════════════════
-function calcOptimalStep(bizList, currentMoney, ascBonus) {
+function calcOptimalStep(bizList: Biz[], currentMoney: number, ascBonus: number): OptimalStep {
 
   // ── helper: PROJECTED revenue/s for a business in a hypothetical state ──
   // Used only to compute the Gain (delta income/sec) of a simulated future
@@ -81,7 +92,7 @@ function calcOptimalStep(bizList, currentMoney, ascBonus) {
   // regardless of its current isRunning flag — this is a projection of
   // production under the new state, not the player's current income.
   // (Current income uses effectiveIncomePerSec() instead — see above.)
-  const revPerSec = (b, overrideOwned, overrideLevel) => {
+  const revPerSec = (b: Biz, overrideOwned?: number, overrideLevel?: number): number => {
     const owned = overrideOwned ?? b.owned;
     const level = overrideLevel ?? b.upgradeLevel;
     if (owned === 0) return 0;
@@ -99,7 +110,7 @@ function calcOptimalStep(bizList, currentMoney, ascBonus) {
     return b.hasManager ? raw : raw * 0.5;
   };
 
-  const cost = b => Math.floor(b.baseCost * Math.pow(b.costMul, b.owned));
+  const cost = (b: Biz) => Math.floor(b.baseCost * Math.pow(b.costMul, b.owned));
 
   // Total current income/sec across the whole empire — used for TimeToAfford.
   // Uses the SHARED effective income model (actual isRunning/hasManager state),
@@ -107,7 +118,7 @@ function calcOptimalStep(bizList, currentMoney, ascBonus) {
   const currentIncomePerSecond = bizList.reduce((s, b) => s + effectiveIncomePerSec(b, ascBonus), 0);
 
   // Unified scoring function used by every action type
-  const score = (actionCost, gain) => {
+  const score = (actionCost: number, gain: number): number => {
     if (gain <= 0) return Infinity; // an action with no payoff is never worth doing
     const timeToAfford = currentIncomePerSecond > 0
       ? Math.max(0, (actionCost - currentMoney) / currentIncomePerSecond)
@@ -115,7 +126,7 @@ function calcOptimalStep(bizList, currentMoney, ascBonus) {
     return timeToAfford + (actionCost / gain);
   };
 
-  const candidates = [];
+  const candidates: NonNullable<OptimalStep>[] = [];
 
   for (const b of bizList) {
     // ── PURCHASE ──
@@ -175,7 +186,7 @@ const freshBiz = () => BIZ_TYPES.map(b => ({
   hasManager: false,
 }));
 
-const fmt = n => {
+const fmt = (n: number): string => {
   if (n >= 1e12) return '$' + (n / 1e12).toFixed(2) + 'T';
   if (n >= 1e9)  return '$' + (n / 1e9 ).toFixed(2) + 'B';
   if (n >= 1e6)  return '$' + (n / 1e6 ).toFixed(2) + 'M';
@@ -190,12 +201,17 @@ export default function IdleEmpire() {
   const [money,    setMoney]    = useState(4);
   const [earned,   setEarned]   = useState(0);
   const [paused,   setPaused]   = useState(false);
-  const [biz,      setBiz]      = useState(freshBiz());
+  const [biz,      setBiz]      = useState<Biz[]>(freshBiz());
   const [tutorial, setTutorial] = useState(true);
   const [ascBonus, setAscBonus] = useState(1);
+  void setAscBonus; // reserved for a future ascension/prestige mechanic
 
   // ── audio ──
-  const [backgroundMusic, setBackgroundMusic] = useState(null);
+  const [backgroundMusic, setBackgroundMusic] = useState<HTMLAudioElement | null>(null);
+  // ← ADD THESE THREE LINES HERE
+  const kachingPool = useRef<HTMLAudioElement[]>([]);
+  const kachingIdx   = useRef(0);
+  const buzzerRef    = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
     const music = new Audio('/sounds/background.mp3');
@@ -203,6 +219,22 @@ export default function IdleEmpire() {
     music.volume = 0.3019;
     setBackgroundMusic(music);
     return () => { music.pause(); music.src = ''; };
+  }, []);
+  // ← ADD THIS NEW useEffect HERE
+  useEffect(() => {
+    kachingPool.current = Array.from({ length: 4 }, () => {
+      const a = new Audio('/sounds/kaching.mp3');
+      a.volume = 0.5;
+      return a;
+    });
+    buzzerRef.current = new Audio('/sounds/buzzer.mp3');
+    buzzerRef.current.volume = 0.6;
+
+    return () => {
+      kachingPool.current.forEach(a => { a.pause(); a.src = ''; });
+      kachingPool.current = [];
+      if (buzzerRef.current) { buzzerRef.current.pause(); buzzerRef.current.src = ''; }
+    };
   }, []);
 
   useEffect(() => {
@@ -215,58 +247,63 @@ export default function IdleEmpire() {
   }, [started, paused, backgroundMusic]);
 
   const playKaching = () => {
+    const pool = kachingPool.current;
+    if (pool.length === 0) return;
+    const a = pool[kachingIdx.current];
+    kachingIdx.current = (kachingIdx.current + 1) % pool.length;
     try {
-      const audio = new Audio('/sounds/kaching.mp3');
-      audio.volume = 0.5;
-      audio.play().catch(() => {});
-    } catch (e) {      
-      console.log(e);
-}
-  };
-
-  const playBuzzer = () => {
-    try {
-      const audio = new Audio('/sounds/buzzer.mp3');
-      audio.volume = 0.6;
-      audio.play().catch(() => {});
+      a.currentTime = 0;
+      a.play().catch(e => console.warn('kaching failed:', e.name, e.message));
     } catch (e) {
-      console.log(e);
+      console.error('kaching error:', e);
     }
   };
 
+  const playBuzzer = () => {
+    const a = buzzerRef.current;
+    if (!a) return;
+    try {
+      a.currentTime = 0;
+      a.play().catch(e => console.warn('buzzer failed:', e.name, e.message));
+    } catch (e) {
+      console.error('buzzer error:', e);
+    }
+  };
+
+
   // punishment state
   const [misses,     setMisses]     = useState(0);
-  const [deadline,   setDeadline]   = useState(null);
-  const [timeLeft,   setTimeLeft]   = useState(null);
-  const [fineLog,    setFineLog]    = useState([]);
+  const [deadline,   setDeadline]   = useState<number | null>(null);
+  const [timeLeft,   setTimeLeft]   = useState<number | null>(null);
+  const [fineLog,    setFineLog]    = useState<FineLogEntry[]>([]);
   const [totalFines, setTotalFines] = useState(0);
   const [shake,      setShake]      = useState(false);
-  const [flashMsg,   setFlashMsg]   = useState(null);
+  const [flashMsg,   setFlashMsg]   = useState<FlashMsg>(null);
   const [botActive,  setBotActive]  = useState(false);
 
   // current optimal step (recomputed after every action)
-  const [optimalStep,    setOptimalStep]    = useState(null);
+  const [optimalStep,    setOptimalStep]    = useState<OptimalStep>(null);
   const [stepsChecked,   setStepsChecked]   = useState(0);  // total steps evaluated (for log)
   const [correctActions, setCorrectActions] = useState(0);  // player matched optimal
 
   // deadlock / freeze
-  const [freezeUntil,    setFreezeUntil]    = useState(null);
+  const [freezeUntil,    setFreezeUntil]    = useState<number | null>(null);
   const [isFrozen,       setIsFrozen]       = useState(false);
   const [deadlockStreak, setDeadlockStreak] = useState(0);
   const [roiPerSec,      setRoiPerSec]      = useState(0);
 
   // refs (game loop reads these without stale closures)
-  const rBiz            = useRef(freshBiz());
+  const rBiz            = useRef<Biz[]>(freshBiz());
   const rMoney          = useRef(4);
   const rEarned         = useRef(0);
   const rMisses         = useRef(0);
-  const rDeadline       = useRef(null);
+  const rDeadline       = useRef<number | null>(null);
   const rBotActive      = useRef(false);
   const rSession        = useRef(Date.now());
-  const rLog            = useRef([]);
-  const rFreezeUntil    = useRef(null);
+  const rLog            = useRef<LogEvent[]>([]);
+  const rFreezeUntil    = useRef<number | null>(null);
   const rDeadlockStreak = useRef(0);
-  const rOptimalStep    = useRef(null);   // what the engine currently expects
+  const rOptimalStep    = useRef<OptimalStep>(null);   // what the engine currently expects
   const rAscBonus       = useRef(1);
 
   useEffect(()=>{ rBiz.current            = biz;            },[biz]);
@@ -281,8 +318,8 @@ export default function IdleEmpire() {
   useEffect(()=>{ rAscBonus.current       = ascBonus;       },[ascBonus]);
 
   // ── calc helpers (used in game loop, must be stable) ──
-  const cost = b => Math.floor(b.baseCost * Math.pow(b.costMul, b.owned));
-  const rev  = (b, overrideOwned, overrideLevel) => {
+  const cost = (b: Biz) => Math.floor(b.baseCost * Math.pow(b.costMul, b.owned));
+  const rev  = (b: Biz, overrideOwned?: number, overrideLevel?: number): number => {
     const owned = overrideOwned ?? b.owned;
     const level = overrideLevel ?? b.upgradeLevel;
     if (owned === 0) return 0;
@@ -296,15 +333,15 @@ export default function IdleEmpire() {
     if (owned >= 200) m *= 5;
     return r * m * rAscBonus.current;
   };
-  const ctime = b => b.baseTime / (1 + b.upgradeLevel * 0.05);
+  const ctime = (b: Biz) => b.baseTime / (1 + b.upgradeLevel * 0.05);
 
   // Current total income/sec — single source of truth, shared with calcOptimalStep.
-  const calcIPS = (bizList) => bizList.reduce(
+  const calcIPS = (bizList: Biz[]): number => bizList.reduce(
     (s, b) => s + effectiveIncomePerSec(b, rAscBonus.current), 0
   );
 
   // ── recompute optimal step and arm timer ──
-  const recomputeOptimal = (bizList, currentMoney, isFirstAction = false) => {
+  const recomputeOptimal = (bizList: Biz[], currentMoney: number, isFirstAction = false): OptimalStep => {
     const step = calcOptimalStep(bizList, currentMoney, rAscBonus.current);
     setOptimalStep(step);
     rOptimalStep.current = step;
@@ -323,7 +360,7 @@ export default function IdleEmpire() {
   // Every event automatically captures ips and currentMisses so analysts
   // can reconstruct income trajectory and punishment exposure for any moment
   // in the session without needing to join against other events.
-  const log = (type, data = {}) => rLog.current.push({
+  const log = (type: string, data: Record<string, any> = {}) => rLog.current.push({
     ts: Date.now(), sMs: Date.now() - rSession.current,
     type, name, money: rMoney.current, earned: rEarned.current,
     ips: calcIPS(rBiz.current),
@@ -331,13 +368,13 @@ export default function IdleEmpire() {
     ...data,
   });
 
-  const flash = (msg, color = '#ef4444') => {
+  const flash = (msg: string, color = '#ef4444') => {
     setFlashMsg({ msg, color });
     setTimeout(() => setFlashMsg(null), 3200);
   };
 
   // ── deadlock check (payback principle) ──
-  const isInDeadlock = (bizList, currentMoney, timeLeftMs) => {
+  const isInDeadlock = (bizList: Biz[], currentMoney: number, timeLeftMs: number | null) => {
     const step = rOptimalStep.current;
     if (!step) return false;
 
@@ -432,7 +469,7 @@ export default function IdleEmpire() {
   };
 
   // ── check if a player action matches the current optimal step ──
-  const checkAction = (type, bizId, isFirstEver, bizListAfter, moneyAfter) => {
+  const checkAction = (type: string, bizId: string, isFirstEver: boolean, bizListAfter: Biz[], moneyAfter: number) => {
     if (isFirstEver) {
       // Only initialize the optimal-step system and start the timer.
       // No optimal step existed before this action, so it must not count
@@ -517,7 +554,7 @@ export default function IdleEmpire() {
   }, [started, paused, ascBonus]);
 
   // ── player actions ──
-  const buyBiz = id => {
+  const buyBiz = (id: string) => {
     const b = rBiz.current.find(x => x.id === id);
     if (!b) return;
     const c = cost(b);
@@ -536,7 +573,7 @@ export default function IdleEmpire() {
     checkAction('PURCHASE', id, isFirstEver, nextBizList, nb);
   };
 
-  const buyUpg = id => {
+  const buyUpg = (id: string) => {
     const b = rBiz.current.find(x => x.id === id);
     if (!b || b.owned === 0) return;
     const c = b.baseCost * 50 * Math.pow(b.upgCostMul, b.upgradeLevel);
@@ -554,7 +591,7 @@ export default function IdleEmpire() {
     checkAction('UPGRADE', id, false, nextBizList, nb);
   };
 
-  const hireMan = id => {
+  const hireMan = (id: string) => {
     const b = rBiz.current.find(x => x.id === id);
     if (!b || b.owned === 0 || b.hasManager || rMoney.current < b.mgrCost) return;
     const nb          = rMoney.current - b.mgrCost;
@@ -570,7 +607,7 @@ export default function IdleEmpire() {
     checkAction('HIRE_MANAGER', id, false, nextBizList, nb);
   };
 
-  const startProd = id => {
+  const startProd = (id: string) => {
     const b = rBiz.current.find(x => x.id === id);
     if (!b || b.owned === 0 || b.isRunning) return;
     const nextBizList = rBiz.current.map(x => x.id === id ? { ...x, isRunning: true, progress: 0 } : x);
@@ -580,9 +617,9 @@ export default function IdleEmpire() {
 
   const download = () => {
     // Explicit cell helpers — never swallow false or 0 via ||
-    const n  = v => (v === undefined || v === null) ? '' : v;
-    const b  = v => (v === undefined || v === null) ? '' : String(v); // booleans as "true"/"false"
-    const r2 = v => (v === undefined || v === null) ? '' : Number(v).toFixed(2);
+    const n  = (v: any) => (v === undefined || v === null) ? '' : v;
+    const b  = (v: any) => (v === undefined || v === null) ? '' : String(v); // booleans as "true"/"false"
+    const r2 = (v: any) => (v === undefined || v === null) ? '' : Number(v).toFixed(2);
 
     const cols = [
       'Timestamp', 'SessionMs', 'EventType', 'ParticipantName',
@@ -649,8 +686,8 @@ export default function IdleEmpire() {
         <label style={{color:'#cbd5e1',fontSize:14,fontWeight:600,display:'block',marginBottom:6}}>Your name:</label>
         <input
           value={name}
-          onChange={e => setName(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') document.getElementById('start-btn').click(); }}
+          onChange={(e: ChangeEvent<HTMLInputElement>) => setName(e.target.value)}
+          onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') document.getElementById('start-btn')?.click(); }}
           placeholder="Enter name..."
           style={{width:'100%',boxSizing:'border-box',padding:'10px 14px',background:'#0f172a',border:'1.5px solid #334155',borderRadius:8,color:'#f8fafc',fontSize:15,marginBottom:16}}
         />
@@ -892,11 +929,11 @@ export default function IdleEmpire() {
               )}
               <div style={{marginTop:10,paddingTop:8,borderTop:'1px solid #1e293b',display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
                 {[
-                  ['Total fined',  fmt(totalFines), '#f87171'],
-                  ['Penalties',    fineLog.length,  '#fb923c'],
-                  ['Consec. miss', misses,          '#facc15'],
-                  ['Accuracy',     accuracy !== null ? `${accuracy}%` : '—', '#a78bfa'],
-                ].map(([l,v,c]) => (
+                  { l: 'Total fined',  v: fmt(totalFines), c: '#f87171' },
+                  { l: 'Penalties',    v: fineLog.length,  c: '#fb923c' },
+                  { l: 'Consec. miss', v: misses,          c: '#facc15' },
+                  { l: 'Accuracy',     v: accuracy !== null ? `${accuracy}%` : '—', c: '#a78bfa' },
+                ].map(({l,v,c}) => (
                   <div key={l} style={{background:'#0f172a',borderRadius:8,padding:'6px 8px'}}>
                     <div style={{fontSize:10,color:'#475569'}}>{l}</div>
                     <div style={{fontSize:14,fontWeight:700,color:c}}>{v}</div>
@@ -923,21 +960,21 @@ export default function IdleEmpire() {
   );
 }
 
-const StatBox = ({label,value,color,large}) => (
+const StatBox = ({label,value,color,large=false}: {label: string; value: string | number; color: string; large?: boolean}) => (
   <div style={{textAlign:'center'}}>
     <div style={{fontSize:10,color:'#94a3b8',textTransform:'uppercase',letterSpacing:0.5}}>{label}</div>
     <div style={{fontSize: large ? 20 : 15,fontWeight:800,color}}>{value}</div>
   </div>
 );
 
-const IcnBtn = ({children,onClick,title}) => (
+const IcnBtn = ({children,onClick,title}: {children: ReactNode; onClick: () => void; title: string}) => (
   <button onClick={onClick} title={title}
     style={{padding:'8px 10px',background:'#334155',border:'none',borderRadius:8,color:'#e2e8f0',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>
     {children}
   </button>
 );
 
-const Btn = ({children,onClick,active,col,tcol}) => (
+const Btn = ({children,onClick,active,col,tcol}: {children: ReactNode; onClick: () => void; active: boolean; col: string; tcol: string}) => (
   <button onClick={active ? onClick : undefined}
     style={{
       padding:'7px 4px',borderRadius:8,border:'none',fontWeight:600,fontSize:12,lineHeight:1.2,
