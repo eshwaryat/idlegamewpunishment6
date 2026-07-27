@@ -436,7 +436,7 @@ export default function IdleEmpire() {
 
     setMoney(nb); rMoney.current = nb;
     setTotalFines(f => f + fine);
-    setFineLog(fl => [...fl.slice(-29), { fine, m, ts: Date.now(), step: rOptimalStep.current }]);
+    setFineLog(fl => [...fl.slice(-299), { fine, m, ts: Date.now(), step: rOptimalStep.current }]);
 
     setShake(true);
     setTimeout(() => setShake(false), 500);
