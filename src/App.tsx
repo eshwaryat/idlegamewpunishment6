@@ -208,7 +208,6 @@ export default function IdleEmpire() {
 
   // ── audio ──
   const [backgroundMusic, setBackgroundMusic] = useState<HTMLAudioElement | null>(null);
-  // ← ADD THESE THREE LINES HERE
   const kachingPool = useRef<HTMLAudioElement[]>([]);
   const kachingIdx   = useRef(0);
   const buzzerRef    = useRef<HTMLAudioElement | null>(null);
@@ -220,7 +219,7 @@ export default function IdleEmpire() {
     setBackgroundMusic(music);
     return () => { music.pause(); music.src = ''; };
   }, []);
-  // ← ADD THIS NEW useEffect HERE
+
   useEffect(() => {
     kachingPool.current = Array.from({ length: 4 }, () => {
       const a = new Audio('/sounds/kaching.mp3');
@@ -283,8 +282,6 @@ export default function IdleEmpire() {
 
   // current optimal step (recomputed after every action)
   const [optimalStep,    setOptimalStep]    = useState<OptimalStep>(null);
-  const [stepsChecked,   setStepsChecked]   = useState(0);  // total steps evaluated (for log)
-  const [correctActions, setCorrectActions] = useState(0);  // player matched optimal
 
   // deadlock / freeze
   const [freezeUntil,    setFreezeUntil]    = useState<number | null>(null);
@@ -461,7 +458,6 @@ export default function IdleEmpire() {
 
     // After punishment, recompute optimal from new state (money may have changed)
     recomputeOptimal(rBiz.current, nb);
-    setStepsChecked(c => c + 1);
 
     if (newStreak >= P.FREEZE_AFTER) {
       setTimeout(() => applyFreeze(), 200);
@@ -472,8 +468,6 @@ export default function IdleEmpire() {
   const checkAction = (type: string, bizId: string, isFirstEver: boolean, bizListAfter: Biz[], moneyAfter: number) => {
     if (isFirstEver) {
       // Only initialize the optimal-step system and start the timer.
-      // No optimal step existed before this action, so it must not count
-      // toward accuracy stats (neither stepsChecked nor correctActions).
       recomputeOptimal(bizListAfter, moneyAfter, true);
       return;
     }
@@ -485,10 +479,8 @@ export default function IdleEmpire() {
       // Correct — reset misses, recompute next optimal
       setMisses(0); rMisses.current = 0;
       setDeadlockStreak(0); rDeadlockStreak.current = 0;
-      setCorrectActions(c => c + 1);
       log('OPTIMAL_MATCH', { actualType: type, actualBiz: bizId, optimalStep: step });
       recomputeOptimal(bizListAfter, moneyAfter);
-      setStepsChecked(c => c + 1);
     } else {
       // Wrong action — log both what the player did and what was expected
       log('OPTIMAL_MISS', { actualType: type, actualBiz: bizId, optimalStep: step });
@@ -670,11 +662,6 @@ export default function IdleEmpire() {
   const warnOn   = botActive && timeLeft !== null && timeLeft <= P.WARN_AT && !isFrozen;
   const urgency  = timeLeft ? Math.max(0, timeLeft / P.WARN_AT) : 1;
   const warnClr  = urgency < 0.3 ? '#ef4444' : urgency < 0.65 ? '#f97316' : '#facc15';
-  // Start at 100% once the system is active (first purchase done), then move
-  // up or down as the player matches or misses optimal steps.
-  const accuracy = !botActive ? null
-    : stepsChecked === 0 ? 100
-    : Math.round((correctActions / stepsChecked) * 100);
 
   // ════════ START SCREEN ════════
   if (!started) return (
@@ -717,7 +704,6 @@ export default function IdleEmpire() {
             setDeadlockStreak(0);  rDeadlockStreak.current = 0;
             setOptimalStep(null);  rOptimalStep.current    = null;
             setFineLog([]); setTotalFines(0);
-            setStepsChecked(0); setCorrectActions(0);
             setStarted(true); setTutorial(true);
             log('SESSION_START', { name });
           }}
@@ -803,7 +789,6 @@ export default function IdleEmpire() {
               <StatBox label="Total"     value={fmt(earned)}     color="#60a5fa" />
               <StatBox label="Fined"     value={fmt(totalFines)} color="#f87171" />
               <StatBox label="Penalties" value={fineLog.length}  color="#fb923c" />
-              {accuracy !== null && <StatBox label="Accuracy" value={`${accuracy}%`} color="#a78bfa" />}
             </div>
             <div style={{display:'flex',gap:8,flexShrink:0}}>
               <IcnBtn onClick={() => setPaused(p => !p)} title={paused ? 'Resume' : 'Pause'}>
@@ -932,7 +917,6 @@ export default function IdleEmpire() {
                   { l: 'Total fined',  v: fmt(totalFines), c: '#f87171' },
                   { l: 'Penalties',    v: fineLog.length,  c: '#fb923c' },
                   { l: 'Consec. miss', v: misses,          c: '#facc15' },
-                  { l: 'Accuracy',     v: accuracy !== null ? `${accuracy}%` : '—', c: '#a78bfa' },
                 ].map(({l,v,c}) => (
                   <div key={l} style={{background:'#0f172a',borderRadius:8,padding:'6px 8px'}}>
                     <div style={{fontSize:10,color:'#475569'}}>{l}</div>
