@@ -30,8 +30,8 @@ const P = {
   WINDOW: 15000,            // ms window per optimal step
   WARN_AT: 6000,            // ms left when warning bar turns orange/red
   BASE: 0.05,               // 5% of balance per miss
-  SCALE: 1.5,               // exponential escalation factor
-  MAX_EXP: 6,               // exponent cap
+  SCALE: 1.25,               // exponential escalation factor
+  MAX_EXP: 7,               // exponent cap
   FREEZE_AFTER: 3,          // consecutive deadlock-wipe rounds before freeze
   DEADLOCK_WIPE_FRAC: 0.95, // punishment must wipe >= this fraction of balance to count
   FREEZE_DURATION: 20000,   // how long a freeze lasts (ms)
